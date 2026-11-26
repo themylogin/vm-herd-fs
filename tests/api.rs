@@ -11,7 +11,7 @@ fn successful_mount() {
     std::fs::create_dir(tree.path("empty")).unwrap();
     let mut daemon = Daemon::start();
     daemon.mount_ok(
-        json!({"src": tree.path("empty"), "overlay": null, "dst": tree.path("d"), "squash": null}),
+        json!({"type": "cattle", "src": tree.path("empty"), "overlay": null, "dst": tree.path("d"), "squash": null}),
     );
     assert!(is_mount_point(&tree.path("d")));
     assert!(names(&tree.path("d")).is_empty());
@@ -86,9 +86,84 @@ fn name_with_a_slash() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
     let mut params = tree.params("h1", "d");
-    params["overlay"]["directories"] = json!(["a/b"]);
+    params["overlay"]["individual"]["directories"] = json!(["a/b"]);
     let reply = daemon.mount(params);
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("overlay.individual.directories"),
+        "{message}"
+    );
+}
+
+#[test]
+fn overlay_without_members() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.params("h1", "d");
+    params["overlay"] = json!({"src": tree.path("overlay"), "directories": [".idea"]});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn relative_shared_src() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.params("h1", "d");
+    params["overlay"]["shared"] = json!({"src": "w/shared"});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("overlay.shared.src"), "{message}");
+}
+
+#[test]
+fn missing_type() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.params("h1", "d");
+    params.as_object_mut().unwrap().remove("type");
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("type"), "{message}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn unknown_type() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.params("h1", "d");
+    params["type"] = json!("sheep");
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn pet_with_an_overlay() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.pet_params("h1", "d");
+    params["overlay"] = json!({"shared": {"src": tree.path("shared")}});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("overlay"), "{message}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn overlay_omitted() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(
+        json!({"type": "cattle", "src": tree.path("h1"), "dst": tree.path("d"), "squash": null}),
+    );
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj3"]);
 }
 
 #[test]

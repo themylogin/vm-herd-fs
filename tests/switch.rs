@@ -27,7 +27,41 @@ fn change_of_host() {
     );
     assert_eq!(names(&tree.path("d/proj2")), [".idea", "main.py"]);
     assert_eq!(names(&tree.path("d/proj3")), [".idea"]);
-    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "tools"]
+    );
+}
+
+#[test]
+fn shared_entry_keeps_its_inode() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.params("h1", "d"));
+    let tools = tree.path("d/tools");
+    let inode = fs::metadata(&tools).unwrap().ino();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(AtomicUsize::new(0));
+    let stat_loop = {
+        let (stop, stats) = (stop.clone(), stats.clone());
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let meta = fs::metadata(&tools).expect("stat during a change");
+                assert_eq!(meta.ino(), inode);
+                stats.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    for round in 0..20 {
+        let before = stats.load(Ordering::SeqCst);
+        daemon.mount_ok(tree.params(["h2", "h1"][round % 2], "d"));
+        while stats.load(Ordering::SeqCst) == before && !stat_loop.is_finished() {
+            thread::yield_now();
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    stat_loop.join().unwrap();
+    assert_eq!(fs::metadata(tree.path("d/tools")).unwrap().ino(), inode);
 }
 
 #[test]

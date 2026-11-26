@@ -22,7 +22,140 @@ fn mounted(host: &str) -> (Tree, Daemon) {
 #[test]
 fn union_of_projects() {
     let (tree, _daemon) = mounted("h1");
-    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "tools"]
+    );
+}
+
+#[test]
+fn pet_lists_src_only() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj3"]);
+    assert_eq!(names(&tree.path("d/proj1")), ["main.py"]);
+    let path = tree.path("d/proj1/main.py");
+    let output = as_user(1000, &format!("echo pet > {}", path.display()));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(tree.path("h1/proj1/main.py")).unwrap(),
+        "pet\n"
+    );
+    let meta = fs::metadata(&path).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (1000, 1000));
+}
+
+#[test]
+fn pet_replaces_a_cattle_view() {
+    let (tree, mut daemon) = mounted("h1");
+    assert_eq!(names(&tree.path("d/proj1")), [".idea", "main.py"]);
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    assert!(common::is_mount_point(&tree.path("d")));
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj3"]);
+    assert_eq!(names(&tree.path("d/proj1")), ["main.py"]);
+}
+
+#[test]
+fn shared_without_individual() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.params("h1", "d");
+    params["overlay"] = json!({"shared": {"src": tree.path("shared")}});
+    daemon.mount_ok(params);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj3", "tools"]
+    );
+    assert_eq!(names(&tree.path("d/proj1")), ["main.py"]);
+}
+
+#[test]
+fn write_to_a_shared_file() {
+    let (tree, _daemon) = mounted("h1");
+    fs::write(tree.path("d/notes.md"), "edited in the view").unwrap();
+    assert_eq!(
+        fs::read_to_string(tree.path("shared/notes.md")).unwrap(),
+        "edited in the view"
+    );
+    assert!(!tree.path("h1/notes.md").exists());
+}
+
+#[test]
+fn shared_file_hides_a_src_file() {
+    let tree = Tree::new();
+    fs::write(tree.path("h1/notes.md"), "host notes").unwrap();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.params("h1", "d"));
+    assert_eq!(
+        fs::read_to_string(tree.path("d/notes.md")).unwrap(),
+        "shared notes\n"
+    );
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "tools"]
+    );
+    fs::write(tree.path("d/notes.md"), "edited").unwrap();
+    assert_eq!(
+        fs::read_to_string(tree.path("h1/notes.md")).unwrap(),
+        "host notes"
+    );
+}
+
+#[test]
+fn shared_directory_hides_a_project() {
+    let tree = Tree::new();
+    fs::create_dir(tree.path("shared/proj3")).unwrap();
+    fs::write(tree.path("shared/proj3/a.txt"), "").unwrap();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.params("h1", "d"));
+    assert_eq!(names(&tree.path("d/proj3")), ["a.txt"]);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "tools"]
+    );
+}
+
+#[test]
+fn remove_inside_a_shared_directory() {
+    let (tree, _daemon) = mounted("h1");
+    fs::remove_file(tree.path("d/tools/run.sh")).unwrap();
+    assert!(!tree.path("shared/tools/run.sh").exists());
+    fs::create_dir(tree.path("d/tools/sub")).unwrap();
+    assert!(tree.path("shared/tools/sub").is_dir());
+    fs::remove_dir(tree.path("d/tools/sub")).unwrap();
+    assert!(!tree.path("shared/tools/sub").exists());
+}
+
+#[test]
+fn remove_a_shared_file() {
+    let (tree, _daemon) = mounted("h1");
+    let err = fs::remove_file(tree.path("d/notes.md")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    assert!(tree.path("shared/notes.md").exists());
+}
+
+#[test]
+fn rename_a_shared_directory() {
+    let (tree, _daemon) = mounted("h1");
+    let err = fs::rename(tree.path("d/tools"), tree.path("d/tools-old")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    assert!(tree.path("shared/tools").is_dir());
+}
+
+#[test]
+fn rename_onto_a_shared_file() {
+    let tree = Tree::new();
+    fs::write(tree.path("h1/README"), "readme").unwrap();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.params("h1", "d"));
+    let err = fs::rename(tree.path("d/README"), tree.path("d/notes.md")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    assert_eq!(
+        fs::read_to_string(tree.path("shared/notes.md")).unwrap(),
+        "shared notes\n"
+    );
+    assert!(tree.path("h1/README").exists());
 }
 
 #[test]
@@ -30,7 +163,7 @@ fn no_overlay() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
     daemon.mount_ok(
-        json!({"src": tree.path("h1"), "overlay": null, "dst": tree.path("d"), "squash": null}),
+        json!({"type": "cattle", "src": tree.path("h1"), "overlay": null, "dst": tree.path("d"), "squash": null}),
     );
     assert_eq!(names(&tree.path("d")), ["proj1", "proj3"]);
     assert_eq!(names(&tree.path("d/proj1")), ["main.py"]);
@@ -39,10 +172,16 @@ fn no_overlay() {
 #[test]
 fn new_project_in_src() {
     let (tree, _daemon) = mounted("h1");
-    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "tools"]
+    );
     fs::create_dir(tree.path("h1/proj4")).unwrap();
     fs::write(tree.path("h1/proj4/main.py"), "new").unwrap();
-    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3", "proj4"]);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "proj4", "tools"]
+    );
     assert_eq!(names(&tree.path("d/proj4")), ["main.py"]);
 }
 

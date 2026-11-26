@@ -172,6 +172,9 @@ impl Tree {
             fs::create_dir_all(&idea).unwrap();
             fs::write(idea.join("workspace.xml"), project).unwrap();
         }
+        fs::create_dir_all(tree.path("shared/tools")).unwrap();
+        fs::write(tree.path("shared/notes.md"), "shared notes\n").unwrap();
+        fs::write(tree.path("shared/tools/run.sh"), "#!/bin/sh\n").unwrap();
         fs::create_dir_all(tree.path("d")).unwrap();
         fs::create_dir_all(tree.path("d2")).unwrap();
         tree
@@ -183,8 +186,23 @@ impl Tree {
 
     pub fn params(&self, host: &str, dst: &str) -> Value {
         json!({
+            "type": "cattle",
             "src": self.path(host),
-            "overlay": {"src": self.path("overlay"), "directories": [".idea"]},
+            "overlay": {
+                "individual": {"src": self.path("overlay"), "directories": [".idea"]},
+                "shared": {"src": self.path("shared")},
+            },
+            "dst": self.path(dst),
+            "squash": {"uid": 1000, "gid": 1000},
+        })
+    }
+}
+
+impl Tree {
+    pub fn pet_params(&self, host: &str, dst: &str) -> Value {
+        json!({
+            "type": "pet",
+            "src": self.path(host),
             "dst": self.path(dst),
             "squash": {"uid": 1000, "gid": 1000},
         })

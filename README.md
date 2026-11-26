@@ -39,8 +39,12 @@ curl -s http://127.0.0.1:8742/api -d '{
   "id": 1,
   "method": "mount",
   "params": {
+    "type": "cattle",
     "src": "/home/user/Dev/.vm-herd/truenas/workdir/192.168.2.130",
-    "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+    "overlay": {
+      "individual": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+      "shared": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/shared"}
+    },
     "dst": "/home/user/Dev/truenas",
     "squash": {"uid": 1000, "gid": 1000}
   }
@@ -51,15 +55,35 @@ On success, the result is `null`.
 
 | Param | Meaning |
 |---|---|
+| `type` | `cattle` or `pet`. A cattle view is described below. A pet view shows `src` at `dst` with `squash` and nothing else: `overlay` must be absent or `null`. A pet comes back after a daemon start, and `umount` refuses it. |
 | `src` | The host directory. `dst` is a passthrough of it. Each directory in it is a project. |
-| `overlay` | `null`, or the store for IDE directories. |
-| `overlay.src` | Holds `<project>/<name>` for each project. Each directory in it is a project too. A project that `src` does not have shows as a read-only directory. |
-| `overlay.directories` | Names such as `.idea`. `dst/<project>/<name>` shows `overlay.src/<project>/<name>` when it exists. A create of `dst/<project>/<name>` creates it there. The same names in `src` stay hidden and untouched. |
+| `overlay` | `null`, or an object with `individual` and `shared`. Absent means `null`. |
+| `overlay.individual` | `null`, or the store for IDE directories. Absent means `null`. |
+| `overlay.individual.src` | Holds `<project>/<name>` for each project. Each directory in it is a project too. A project that `src` does not have shows as a read-only directory. |
+| `overlay.individual.directories` | Names such as `.idea`. `dst/<project>/<name>` shows `overlay.individual.src/<project>/<name>` when it exists. A create of `dst/<project>/<name>` creates it there. The same names in `src` stay hidden and untouched. |
+| `overlay.shared` | `null`, or the store for entries at the root of `dst`. Absent means `null`. |
+| `overlay.shared.src` | Each file and directory in it shows at the root of `dst` and is writable. An entry of the same name in `src`, a project directory included, stays hidden and untouched. The entries cannot be removed or renamed; entries inside a shared directory can. |
 | `dst` | The mount point. |
 | `squash` | `null`, or `{"uid", "gid"}`. With `squash`, every file shows as `uid:gid`, new files get owner 0:0 on disk, and chown changes nothing on disk. Without it, files show their real owners and new files belong to the caller. |
 
 All paths must be absolute paths of existing directories. `dst` must not overlap `src`,
-`overlay.src`, or another served `dst`.
+`overlay.individual.src`, `overlay.shared.src`, or another served `dst`.
+
+A pet mount:
+
+```sh
+curl -s http://127.0.0.1:8742/api -d '{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "mount",
+  "params": {
+    "type": "pet",
+    "src": "/home/user/Dev/.vm-herd/pets/workstation",
+    "dst": "/home/user/Dev/workstation",
+    "squash": {"uid": 1000, "gid": 1000}
+  }
+}'
+```
 
 A `mount` call for a `dst` that the daemon already serves changes the view in place. Use this
 to change the host. A `mount` call for a `dst` with another mount at or below it fails.
@@ -70,7 +94,7 @@ to change the host. A `mount` call for a `dst` with another mount at or below it
 | `-32600` | The body is not a JSON-RPC 2.0 request. |
 | `-32601` | The method is not `mount`, `umount`, or `mounts`. |
 | `-32602` | A param is wrong. The message names it. |
-| `-32000` | The call failed, for example because of a foreign mount at `dst`, or `umount` for a `dst` that is not served. |
+| `-32000` | The call failed, for example because of a foreign mount at `dst`, or `umount` for a `dst` that is not served or holds a pet view. |
 
 ### umount
 
@@ -86,11 +110,13 @@ curl -s http://127.0.0.1:8742/api -d '{
 ```
 
 - When `state.json` holds `dst`, the view changes in place to the restored view: every project
-  of `overlay.src` with only its overlay directories. The mount stays.
+  of `overlay.individual.src` with only its overlay directories, and the entries of
+  `overlay.shared.src`. The mount stays.
 - Otherwise, the daemon unmounts `dst`. Open files do not block the call.
 
-`umount` does not change `state.json`. For a `dst` that the daemon does not serve, it fails
-with `-32000`.
+`umount` does not change `state.json`. For a `dst` that the daemon does not serve, or that holds
+a pet view, it fails with `-32000`. To free a pet `dst`, mount a cattle view without `overlay`
+there, then call `umount`.
 
 ### mounts
 
@@ -104,8 +130,12 @@ curl -s http://127.0.0.1:8742/api -d '{"jsonrpc": "2.0", "id": 3, "method": "mou
 ```json
 {"id": 3, "jsonrpc": "2.0", "result": [
   {
+    "type": "cattle",
     "src": "/home/user/Dev/.vm-herd/truenas/workdir/192.168.2.130",
-    "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+    "overlay": {
+      "individual": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+      "shared": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/shared"}
+    },
     "dst": "/home/user/Dev/truenas",
     "squash": {"uid": 1000, "gid": 1000}
   }
@@ -113,7 +143,8 @@ curl -s http://127.0.0.1:8742/api -d '{"jsonrpc": "2.0", "id": 3, "method": "mou
 ```
 
 Each item has the form of the `mount` params, with the config that the view shows now. `src`
-is `null` for a restored view, after a daemon start or after `umount`. Params other than none,
+is `null` for a restored cattle view, after a daemon start or after `umount`. A pet item shows
+its `src` and `overlay` `null`. A cattle `overlay` always has both members, `null` included. Params other than none,
 `null`, `{}`, or `[]` fail with `-32602`.
 
 ## Changes made outside the view
@@ -131,25 +162,36 @@ After each successful `mount`, the daemon writes `<data-dir>/state.json`:
   "version": 1,
   "mounts": [
     {
+      "type": "cattle",
       "dst": "/home/user/Dev/truenas",
-      "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+      "overlay": {
+        "individual": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+        "shared": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/shared"}
+      },
+      "squash": {"uid": 1000, "gid": 1000}
+    },
+    {
+      "type": "pet",
+      "dst": "/home/user/Dev/workstation",
+      "src": "/home/user/Dev/.vm-herd/pets/workstation",
       "squash": {"uid": 1000, "gid": 1000}
     }
   ]
 }
 ```
 
-The file holds each `dst` whose last `mount` had an `overlay`. A `mount` without `overlay`
-removes the `dst` from the file.
+The file holds each cattle `dst` whose last `mount` had an `overlay`, and each pet `dst`. A
+cattle `mount` without `overlay` removes the `dst` from the file.
 
 When the daemon stops or crashes, each `dst` stays as a dead mount ("Transport endpoint is not
 connected"). At the next start, the daemon detaches its earlier mount at each stored `dst`
-and mounts a view without `src`: every project of `overlay.src` shows with only its overlay
-directories, and the root is read-only. The next `mount` call for that `dst` replaces the view
+and mounts a view without `src`: every project of `overlay.individual.src` shows with only its
+overlay directories, the entries of `overlay.shared.src` show, and the root is read-only. For a
+pet item, it mounts the stored `src` at `dst` again. The next `mount` call for that `dst` replaces the view
 in place. Only one daemon can run on a host.
 
-The daemon skips a stored `dst` that is missing or holds another mount, prints the reason,
-and keeps the item in the file. It does not start when `state.json` has an unknown `version`.
+The daemon skips a stored `dst` that is missing or holds another mount, and a pet whose `src`
+is missing. It prints the reason and keeps the item in the file. It does not start when `state.json` has an unknown `version`.
 
 ## Checks
 

@@ -8,11 +8,26 @@ use crate::api::OverlayParams;
 use crate::view::Squash;
 
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StoredMount {
-    pub dst: PathBuf,
-    pub overlay: OverlayParams,
-    pub squash: Option<Squash>,
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum StoredMount {
+    Cattle {
+        dst: PathBuf,
+        overlay: OverlayParams,
+        squash: Option<Squash>,
+    },
+    Pet {
+        dst: PathBuf,
+        src: PathBuf,
+        squash: Option<Squash>,
+    },
+}
+
+impl StoredMount {
+    pub fn dst(&self) -> &Path {
+        match self {
+            Self::Cattle { dst, .. } | Self::Pet { dst, .. } => dst,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -61,6 +76,7 @@ pub fn save(data_dir: &Path, mounts: Vec<StoredMount>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{IndividualParams, SharedParams};
 
     fn write(dir: &Path, text: &str) {
         std::fs::write(dir.join("state.json"), text).unwrap();
@@ -73,23 +89,96 @@ mod tests {
     }
 
     #[test]
-    fn version_1() {
+    fn cattle_item() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
-            r#"{"version": 1, "mounts": [{"dst": "/d", "overlay": {"src": "/w/overlay", "directories": [".idea"]}, "squash": {"uid": 1000, "gid": 1000}}]}"#,
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"individual": {"src": "/w/overlay", "directories": [".idea"]}, "shared": {"src": "/w/shared"}}, "squash": {"uid": 1000, "gid": 1000}}]}"#,
         );
         let mounts = load(dir.path()).unwrap();
         assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].dst, Path::new("/d"));
-        assert_eq!(mounts[0].overlay.directories, [".idea"]);
+        assert_eq!(mounts[0].dst(), Path::new("/d"));
+        let StoredMount::Cattle {
+            overlay, squash, ..
+        } = &mounts[0]
+        else {
+            panic!("not a cattle item");
+        };
+        let individual = overlay.individual.as_ref().unwrap();
+        assert_eq!(individual.directories, [".idea"]);
+        let shared = overlay.shared.as_ref().unwrap();
+        assert_eq!(shared.src, Path::new("/w/shared"));
         assert_eq!(
-            mounts[0].squash,
+            *squash,
             Some(Squash {
                 uid: 1000,
                 gid: 1000
             })
         );
+    }
+
+    #[test]
+    fn pet_item() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"{"version": 1, "mounts": [{"type": "pet", "dst": "/d", "src": "/w/h1", "squash": null}]}"#,
+        );
+        let mounts = load(dir.path()).unwrap();
+        assert_eq!(mounts[0].dst(), Path::new("/d"));
+        let StoredMount::Pet { src, squash, .. } = &mounts[0] else {
+            panic!("not a pet item");
+        };
+        assert_eq!(src, Path::new("/w/h1"));
+        assert_eq!(*squash, None);
+    }
+
+    #[test]
+    fn item_without_type() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"{"version": 1, "mounts": [{"dst": "/d", "src": "/w/h1", "squash": null}]}"#,
+        );
+        let err = load(dir.path()).err().unwrap();
+        assert!(err.contains("`type`"), "{err}");
+    }
+
+    #[test]
+    fn cattle_item_with_src() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "src": "/w/h1", "overlay": {"shared": {"src": "/w/shared"}}, "squash": null}]}"#,
+        );
+        let err = load(dir.path()).err().unwrap();
+        assert!(err.contains("unknown field `src`"), "{err}");
+    }
+
+    #[test]
+    fn overlay_without_members() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"src": "/w/overlay", "directories": [".idea"]}, "squash": null}]}"#,
+        );
+        let err = load(dir.path()).err().unwrap();
+        assert!(err.contains("unknown field `src`"), "{err}");
+    }
+
+    #[test]
+    fn omitted_members_are_null() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"shared": {"src": "/w/shared"}}, "squash": null}]}"#,
+        );
+        let mounts = load(dir.path()).unwrap();
+        let StoredMount::Cattle { overlay, .. } = &mounts[0] else {
+            panic!("not a cattle item");
+        };
+        assert!(overlay.individual.is_none());
+        assert!(overlay.shared.is_some());
     }
 
     #[test]
@@ -110,18 +199,34 @@ mod tests {
     #[test]
     fn save_then_load() {
         let dir = tempfile::tempdir().unwrap();
-        let mount = StoredMount {
+        let cattle = StoredMount::Cattle {
             dst: "/d".into(),
             overlay: OverlayParams {
-                src: "/w/overlay".into(),
-                directories: vec![".idea".into()],
+                individual: Some(IndividualParams {
+                    src: "/w/overlay".into(),
+                    directories: vec![".idea".into()],
+                }),
+                shared: Some(SharedParams {
+                    src: "/w/shared".into(),
+                }),
             },
             squash: None,
         };
-        save(dir.path(), vec![mount]).unwrap();
+        let pet = StoredMount::Pet {
+            dst: "/d2".into(),
+            src: "/w/h1".into(),
+            squash: Some(Squash {
+                uid: 1000,
+                gid: 1000,
+            }),
+        };
+        save(dir.path(), vec![cattle, pet]).unwrap();
         assert!(!dir.path().join("state.json.tmp").exists());
+        let text = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(text.contains(r#""type": "cattle""#), "{text}");
+        assert!(text.contains(r#""type": "pet""#), "{text}");
         let mounts = load(dir.path()).unwrap();
-        assert_eq!(mounts[0].dst, Path::new("/d"));
-        assert_eq!(mounts[0].squash, None);
+        assert_eq!(mounts[0].dst(), Path::new("/d"));
+        assert!(matches!(&mounts[1], StoredMount::Pet { src, .. } if src == Path::new("/w/h1")));
     }
 }

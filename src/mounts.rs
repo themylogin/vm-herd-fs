@@ -9,9 +9,9 @@ use std::sync::Arc;
 use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
 use rustix::fs::{Mode, OFlags};
 
-use crate::api::{MountParams, MountsItem, OverlayParams};
+use crate::api::{MountParams, MountType, MountsItem, OverlayParams};
 use crate::state::{self, StoredMount};
-use crate::view::{Config, Fs, Invalidation, Overlay, Squash, View};
+use crate::view::{Config, Fs, Individual, Invalidation, Shared, Squash, View};
 
 pub enum MountError {
     InvalidParams(String),
@@ -35,6 +35,7 @@ struct Mounted {
 
 #[derive(Clone)]
 struct Shown {
+    type_: MountType,
     src: Option<PathBuf>,
     overlay: Option<OverlayParams>,
     squash: Option<Squash>,
@@ -53,7 +54,7 @@ impl Registry {
             mounts: BTreeMap::new(),
             stored: stored
                 .into_iter()
-                .map(|item| (item.dst.clone(), item))
+                .map(|item| (item.dst().to_owned(), item))
                 .collect(),
         }
     }
@@ -62,39 +63,37 @@ impl Registry {
         let items: Vec<StoredMount> = self.stored.values().cloned().collect();
         for item in items {
             if let Err(reason) = self.restore_item(&item) {
-                eprintln!("restore {}: skipped: {reason}", item.dst.display());
+                eprintln!("restore {}: skipped: {reason}", item.dst().display());
             }
         }
     }
 
     fn restore_item(&mut self, item: &StoredMount) -> Result<(), MountError> {
+        let dst = item.dst();
         while let Some(earlier) = mount_entries()?.into_iter().find(|entry| {
-            entry.mount_point == item.dst && entry.fs_type == "fuse" && entry.source == "vm-herd-fs"
+            entry.mount_point == dst && entry.fs_type == "fuse" && entry.source == "vm-herd-fs"
         }) {
             rustix::mount::unmount(&earlier.mount_point, rustix::mount::UnmountFlags::DETACH)
                 .map_err(|err| MountError::Failed(format!("detach the earlier mount: {err}")))?;
         }
-        if !item.dst.is_dir() {
+        if !dst.is_dir() {
             return Err(MountError::Failed("dst is not a directory".into()));
         }
-        if let Some(entry) = foreign_mount(&item.dst)? {
+        if let Some(entry) = foreign_mount(dst)? {
             return Err(MountError::Failed(format!(
                 "{} holds a {} mount",
                 entry.mount_point.display(),
                 entry.fs_type
             )));
         }
-        self.attach(
-            item.dst.clone(),
-            restored_config(item)?,
-            restored_shown(item),
-        )
+        self.attach(dst.to_owned(), restored_config(item)?, restored_shown(item))
     }
 
     pub fn mounts(&self) -> Vec<MountsItem> {
         self.mounts
             .iter()
             .map(|(dst, mounted)| MountsItem {
+                type_: mounted.shown.type_,
                 src: mounted.shown.src.clone(),
                 overlay: mounted.shown.overlay.clone(),
                 dst: dst.clone(),
@@ -113,13 +112,22 @@ impl Registry {
         let not_served = || MountError::Failed(format!("dst {} is not served", dst.display()));
         let dst = std::fs::canonicalize(dst).map_err(|_| not_served())?;
         let mounted = self.mounts.get_mut(&dst).ok_or_else(not_served)?;
-        if let Some(item) = self.stored.get(&dst) {
-            invalidate(
-                &mounted.notifier,
-                mounted.view.replace(restored_config(item)?),
-            );
-            mounted.shown = restored_shown(item);
-            return Ok(());
+        match self.stored.get(&dst) {
+            Some(StoredMount::Pet { .. }) => {
+                return Err(MountError::Failed(format!(
+                    "dst {} is a pet view",
+                    dst.display()
+                )));
+            }
+            Some(item) => {
+                invalidate(
+                    &mounted.notifier,
+                    mounted.view.replace(restored_config(item)?),
+                );
+                mounted.shown = restored_shown(item);
+                return Ok(());
+            }
+            None => {}
         }
         rustix::mount::unmount(&dst, rustix::mount::UnmountFlags::DETACH)
             .map_err(|err| MountError::Failed(format!("unmount {}: {err}", dst.display())))?;
@@ -132,21 +140,41 @@ impl Registry {
     pub fn mount(&mut self, params: MountParams) -> Result<(), MountError> {
         let src = existing_dir("src", &params.src)?;
         let dst = existing_dir("dst", &params.dst)?;
-        let overlay = match &params.overlay {
-            Some(overlay) => {
-                for name in &overlay.directories {
+        if params.type_ == MountType::Pet && params.overlay.is_some() {
+            return Err(MountError::InvalidParams(
+                "overlay is not allowed for type pet".into(),
+            ));
+        }
+        let individual = match params
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.individual.as_ref())
+        {
+            Some(individual) => {
+                for name in &individual.directories {
                     check_name(name)?;
                 }
                 Some((
-                    existing_dir("overlay.src", &overlay.src)?,
-                    &overlay.directories,
+                    existing_dir("overlay.individual.src", &individual.src)?,
+                    &individual.directories,
                 ))
             }
             None => None,
         };
+        let shared = match params
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.shared.as_ref())
+        {
+            Some(shared) => Some(existing_dir("overlay.shared.src", &shared.src)?),
+            None => None,
+        };
         check_apart(&dst, "src", &src)?;
-        if let Some((overlay_src, _)) = &overlay {
-            check_apart(&dst, "overlay.src", overlay_src)?;
+        if let Some((individual_src, _)) = &individual {
+            check_apart(&dst, "overlay.individual.src", individual_src)?;
+        }
+        if let Some(shared_src) = &shared {
+            check_apart(&dst, "overlay.shared.src", shared_src)?;
         }
         for served in self.mounts.keys().filter(|served| **served != dst) {
             check_apart(&dst, "a served dst", served)?;
@@ -154,10 +182,15 @@ impl Registry {
 
         let config = Config {
             src: Some(open_dir(&src)?),
-            overlay: match overlay {
-                Some((overlay_src, directories)) => Some(Overlay {
-                    src: open_dir(&overlay_src)?,
-                    directories: directories.iter().map(OsString::from).collect(),
+            individual: match individual {
+                Some((individual_src, directories)) => {
+                    Some(open_individual(&individual_src, directories)?)
+                }
+                None => None,
+            },
+            shared: match shared {
+                Some(shared_src) => Some(Shared {
+                    src: open_dir(&shared_src)?,
                 }),
                 None => None,
             },
@@ -165,6 +198,7 @@ impl Registry {
         };
 
         let shown = Shown {
+            type_: params.type_,
             src: Some(params.src.clone()),
             overlay: params.overlay.clone(),
             squash: params.squash,
@@ -182,22 +216,25 @@ impl Registry {
             }
             self.attach(dst.clone(), config, shown)?;
         }
-        self.store(dst, params.overlay, params.squash)
+        let item = match (params.type_, params.overlay) {
+            (MountType::Pet, _) => Some(StoredMount::Pet {
+                dst: dst.clone(),
+                src: params.src,
+                squash: params.squash,
+            }),
+            (MountType::Cattle, Some(overlay)) => Some(StoredMount::Cattle {
+                dst: dst.clone(),
+                overlay,
+                squash: params.squash,
+            }),
+            (MountType::Cattle, None) => None,
+        };
+        self.store(dst, item)
     }
 
-    fn store(
-        &mut self,
-        dst: PathBuf,
-        overlay: Option<OverlayParams>,
-        squash: Option<Squash>,
-    ) -> Result<(), MountError> {
-        match overlay {
-            Some(overlay) => {
-                let item = StoredMount {
-                    dst: dst.clone(),
-                    overlay,
-                    squash,
-                };
+    fn store(&mut self, dst: PathBuf, item: Option<StoredMount>) -> Result<(), MountError> {
+        match item {
+            Some(item) => {
                 self.stored.insert(dst, item);
             }
             None => {
@@ -236,29 +273,64 @@ impl Registry {
 }
 
 fn restored_config(item: &StoredMount) -> Result<Config, MountError> {
-    for name in &item.overlay.directories {
-        check_name(name)?;
-    }
-    Ok(Config {
-        src: None,
-        overlay: Some(Overlay {
-            src: open_dir(&item.overlay.src)?,
-            directories: item
-                .overlay
-                .directories
-                .iter()
-                .map(OsString::from)
-                .collect(),
+    match item {
+        StoredMount::Pet { src, squash, .. } => Ok(Config {
+            src: Some(open_dir(src)?),
+            individual: None,
+            shared: None,
+            squash: *squash,
         }),
-        squash: item.squash,
+        StoredMount::Cattle {
+            overlay, squash, ..
+        } => {
+            let individual = match &overlay.individual {
+                Some(individual) => {
+                    for name in &individual.directories {
+                        check_name(name)?;
+                    }
+                    Some(open_individual(&individual.src, &individual.directories)?)
+                }
+                None => None,
+            };
+            let shared = match &overlay.shared {
+                Some(shared) => Some(Shared {
+                    src: open_dir(&shared.src)?,
+                }),
+                None => None,
+            };
+            Ok(Config {
+                src: None,
+                individual,
+                shared,
+                squash: *squash,
+            })
+        }
+    }
+}
+
+fn open_individual(src: &Path, directories: &[String]) -> Result<Individual, MountError> {
+    Ok(Individual {
+        src: open_dir(src)?,
+        directories: directories.iter().map(OsString::from).collect(),
     })
 }
 
 fn restored_shown(item: &StoredMount) -> Shown {
-    Shown {
-        src: None,
-        overlay: Some(item.overlay.clone()),
-        squash: item.squash,
+    match item {
+        StoredMount::Cattle {
+            overlay, squash, ..
+        } => Shown {
+            type_: MountType::Cattle,
+            src: None,
+            overlay: Some(overlay.clone()),
+            squash: *squash,
+        },
+        StoredMount::Pet { src, squash, .. } => Shown {
+            type_: MountType::Pet,
+            src: Some(src.clone()),
+            overlay: None,
+            squash: *squash,
+        },
     }
 }
 
@@ -283,7 +355,7 @@ fn existing_dir(param: &str, path: &Path) -> Result<PathBuf, MountError> {
 fn check_name(name: &str) -> Result<(), MountError> {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
         return Err(MountError::InvalidParams(format!(
-            "overlay.directories item {name:?} must be a plain name"
+            "overlay.individual.directories item {name:?} must be a plain name"
         )));
     }
     Ok(())

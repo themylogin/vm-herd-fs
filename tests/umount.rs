@@ -48,6 +48,22 @@ fn state_file_stays() {
 }
 
 #[test]
+fn pet_view() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    let before = fs::read(daemon.data_dir().join("state.json")).unwrap();
+    let reply = umount(&daemon, tree.path("d"));
+    assert_eq!(reply["error"]["code"], -32000, "{reply}");
+    assert!(is_mount_point(&tree.path("d")));
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj3"]);
+    assert_eq!(
+        fs::read(daemon.data_dir().join("state.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn back_to_the_restored_view() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
@@ -57,7 +73,10 @@ fn back_to_the_restored_view() {
     assert_eq!(reply["result"], Value::Null, "{reply}");
     assert!(reply.get("error").is_none(), "{reply}");
     assert!(is_mount_point(&tree.path("d")));
-    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj2", "proj3", "tools"]
+    );
     assert_eq!(names(&tree.path("d/proj1")), [".idea"]);
     assert_eq!(
         fs::metadata(tree.path("d/proj1/.idea")).unwrap().ino(),

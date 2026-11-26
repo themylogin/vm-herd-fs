@@ -7,9 +7,18 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::mounts::{MountError, Registry};
 use crate::view::Squash;
 
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MountType {
+    Cattle,
+    Pet,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MountParams {
+    #[serde(rename = "type")]
+    pub type_: MountType,
     pub src: PathBuf,
     pub overlay: Option<OverlayParams>,
     pub dst: PathBuf,
@@ -18,6 +27,8 @@ pub struct MountParams {
 
 #[derive(Serialize)]
 pub struct MountsItem {
+    #[serde(rename = "type")]
+    pub type_: MountType,
     pub src: Option<PathBuf>,
     pub overlay: Option<OverlayParams>,
     pub dst: PathBuf,
@@ -33,8 +44,21 @@ struct UmountParams {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayParams {
+    pub individual: Option<IndividualParams>,
+    pub shared: Option<SharedParams>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndividualParams {
     pub src: PathBuf,
     pub directories: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedParams {
+    pub src: PathBuf,
 }
 
 struct RpcError {

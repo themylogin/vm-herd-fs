@@ -36,8 +36,12 @@ fn mounted_host() {
     assert_eq!(
         mounts(&daemon),
         json!([{
+            "type": "cattle",
             "src": tree.path("h1"),
-            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "overlay": {
+                "individual": {"src": tree.path("overlay"), "directories": [".idea"]},
+                "shared": {"src": tree.path("shared")},
+            },
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -76,8 +80,30 @@ fn restored_view_after_a_restart() {
     assert_eq!(
         mounts(&daemon),
         json!([{
+            "type": "cattle",
             "src": null,
-            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "overlay": {
+                "individual": {"src": tree.path("overlay"), "directories": [".idea"]},
+                "shared": {"src": tree.path("shared")},
+            },
+            "dst": tree.path("d"),
+            "squash": {"uid": 1000, "gid": 1000},
+        }])
+    );
+}
+
+#[test]
+fn pet_after_a_restart() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    daemon.restart();
+    assert_eq!(
+        mounts(&daemon),
+        json!([{
+            "type": "pet",
+            "src": tree.path("h1"),
+            "overlay": null,
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -94,7 +120,10 @@ fn restored_view_after_umount() {
     let result = mounts(&daemon);
     assert_eq!(result.as_array().unwrap().len(), 1);
     assert_eq!(result[0]["src"], Value::Null);
-    assert_eq!(result[0]["overlay"]["src"], json!(tree.path("overlay")));
+    assert_eq!(
+        result[0]["overlay"]["individual"]["src"],
+        json!(tree.path("overlay"))
+    );
 }
 
 #[test]
