@@ -22,10 +22,10 @@ The binary is static, so it runs on old distributions too.
 ## Start
 
 ```sh
-sudo ./dist/vm-herd-fs --listen 127.0.0.1:8742
+sudo ./dist/vm-herd-fs --listen 127.0.0.1:8742 --data-dir /var/lib/vm-herd-fs
 ```
 
-The daemon prints `listening on <address>`. The API has no authentication. Any process that can
+The daemon creates the data directory when it is missing. It prints `listening on <address>`. The API has no authentication. Any process that can
 reach the address can mount any directory as root. Bind to `127.0.0.1`.
 
 ## API
@@ -78,10 +78,34 @@ Changes in `src`, for example from NFS clients, show in `dst` within 1 second. T
 no inotify events. JetBrains IDEs show "External file changes sync may be slow" for the view.
 They refresh when their window gets focus, or with "File | Reload All from Disk".
 
-## Stop
+## Restart
+
+After each successful `mount`, the daemon writes `<data-dir>/state.json`:
+
+```json
+{
+  "version": 1,
+  "mounts": [
+    {
+      "dst": "/home/user/Dev/truenas",
+      "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+      "squash": {"uid": 1000, "gid": 1000}
+    }
+  ]
+}
+```
+
+The file holds each `dst` whose last `mount` had an `overlay`. A `mount` without `overlay`
+removes the `dst` from the file.
 
 When the daemon stops or crashes, each `dst` stays as a dead mount ("Transport endpoint is not
-connected"). A new `mount` call for it fails until you run `sudo umount -l <dst>`.
+connected"). At the next start, the daemon detaches its earlier mount at each stored `dst`
+and mounts a view without `src`: every project of `overlay.src` shows with only its overlay
+directories, and the root is read-only. The next `mount` call for that `dst` replaces the view
+in place. Only one daemon can run on a host.
+
+The daemon skips a stored `dst` that is missing or holds another mount, prints the reason,
+and keeps the item in the file. It does not start when `state.json` has an unknown `version`.
 
 ## Checks
 

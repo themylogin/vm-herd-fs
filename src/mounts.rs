@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::fmt;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -8,12 +9,21 @@ use std::sync::Arc;
 use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
 use rustix::fs::{Mode, OFlags};
 
-use crate::api::MountParams;
+use crate::api::{MountParams, OverlayParams};
+use crate::state::{self, StoredMount};
 use crate::view::{Config, Fs, Invalidation, Overlay, View};
 
 pub enum MountError {
     InvalidParams(String),
     Failed(String),
+}
+
+impl fmt::Display for MountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidParams(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
 }
 
 struct Mounted {
@@ -22,12 +32,69 @@ struct Mounted {
     view: Arc<View>,
 }
 
-#[derive(Default)]
 pub struct Registry {
+    data_dir: PathBuf,
     mounts: HashMap<PathBuf, Mounted>,
+    stored: BTreeMap<PathBuf, StoredMount>,
 }
 
 impl Registry {
+    pub fn new(data_dir: PathBuf, stored: Vec<StoredMount>) -> Self {
+        Self {
+            data_dir,
+            mounts: HashMap::new(),
+            stored: stored
+                .into_iter()
+                .map(|item| (item.dst.clone(), item))
+                .collect(),
+        }
+    }
+
+    pub fn restore(&mut self) {
+        let items: Vec<StoredMount> = self.stored.values().cloned().collect();
+        for item in items {
+            if let Err(reason) = self.restore_item(&item) {
+                eprintln!("restore {}: skipped: {reason}", item.dst.display());
+            }
+        }
+    }
+
+    fn restore_item(&mut self, item: &StoredMount) -> Result<(), MountError> {
+        while let Some(earlier) = mount_entries()?.into_iter().find(|entry| {
+            entry.mount_point == item.dst && entry.fs_type == "fuse" && entry.source == "vm-herd-fs"
+        }) {
+            rustix::mount::unmount(&earlier.mount_point, rustix::mount::UnmountFlags::DETACH)
+                .map_err(|err| MountError::Failed(format!("detach the earlier mount: {err}")))?;
+        }
+        if !item.dst.is_dir() {
+            return Err(MountError::Failed("dst is not a directory".into()));
+        }
+        if let Some(entry) = foreign_mount(&item.dst)? {
+            return Err(MountError::Failed(format!(
+                "{} holds a {} mount",
+                entry.mount_point.display(),
+                entry.fs_type
+            )));
+        }
+        for name in &item.overlay.directories {
+            check_name(name)?;
+        }
+        let config = Config {
+            src: None,
+            overlay: Some(Overlay {
+                src: open_dir(&item.overlay.src)?,
+                directories: item
+                    .overlay
+                    .directories
+                    .iter()
+                    .map(OsString::from)
+                    .collect(),
+            }),
+            squash: item.squash,
+        };
+        self.attach(item.dst.clone(), config)
+    }
+
     pub fn mount(&mut self, params: MountParams) -> Result<(), MountError> {
         let src = existing_dir("src", &params.src)?;
         let dst = existing_dir("dst", &params.dst)?;
@@ -52,7 +119,7 @@ impl Registry {
         }
 
         let config = Config {
-            src: open_dir(&src)?,
+            src: Some(open_dir(&src)?),
             overlay: match overlay {
                 Some((overlay_src, directories)) => Some(Overlay {
                     src: open_dir(&overlay_src)?,
@@ -65,14 +132,43 @@ impl Registry {
 
         if let Some(mounted) = self.mounts.get(&dst) {
             invalidate(&mounted.notifier, mounted.view.replace(config));
-            return Ok(());
+        } else {
+            if let Some(entry) = foreign_mount(&dst)? {
+                return Err(MountError::Failed(format!(
+                    "{} holds a {} mount",
+                    entry.mount_point.display(),
+                    entry.fs_type
+                )));
+            }
+            self.attach(dst.clone(), config)?;
         }
-        if let Some((mount_point, fs_type)) = foreign_mount(&dst)? {
-            return Err(MountError::Failed(format!(
-                "{} holds a {fs_type} mount",
-                mount_point.display()
-            )));
+        self.store(dst, params.overlay, params.squash)
+    }
+
+    fn store(
+        &mut self,
+        dst: PathBuf,
+        overlay: Option<OverlayParams>,
+        squash: Option<crate::view::Squash>,
+    ) -> Result<(), MountError> {
+        match overlay {
+            Some(overlay) => {
+                let item = StoredMount {
+                    dst: dst.clone(),
+                    overlay,
+                    squash,
+                };
+                self.stored.insert(dst, item);
+            }
+            None => {
+                self.stored.remove(&dst);
+            }
         }
+        state::save(&self.data_dir, self.stored.values().cloned().collect())
+            .map_err(|err| MountError::Failed(format!("write the state file: {err}")))
+    }
+
+    fn attach(&mut self, dst: PathBuf, config: Config) -> Result<(), MountError> {
         let view = Arc::new(View::new(config));
         let mut options = fuser::Config::default();
         options.mount_options = vec![
@@ -146,22 +242,39 @@ fn open_dir(path: &Path) -> Result<Arc<OwnedFd>, MountError> {
     .map_err(|err| MountError::Failed(format!("open {}: {err}", path.display())))
 }
 
-fn foreign_mount(dst: &Path) -> Result<Option<(PathBuf, String)>, MountError> {
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|err| MountError::Failed(format!("read /proc/self/mountinfo: {err}")))?;
-    Ok(parse_mountinfo(&mountinfo)
-        .into_iter()
-        .find(|(mount_point, _)| mount_point.starts_with(dst)))
+#[derive(Debug, PartialEq)]
+struct MountEntry {
+    mount_point: PathBuf,
+    fs_type: String,
+    source: String,
 }
 
-fn parse_mountinfo(mountinfo: &str) -> Vec<(PathBuf, String)> {
+fn mount_entries() -> Result<Vec<MountEntry>, MountError> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|err| MountError::Failed(format!("read /proc/self/mountinfo: {err}")))?;
+    Ok(parse_mountinfo(&mountinfo))
+}
+
+fn foreign_mount(dst: &Path) -> Result<Option<MountEntry>, MountError> {
+    Ok(mount_entries()?
+        .into_iter()
+        .find(|entry| entry.mount_point.starts_with(dst)))
+}
+
+fn parse_mountinfo(mountinfo: &str) -> Vec<MountEntry> {
     mountinfo
         .lines()
         .filter_map(|line| {
             let (mount, fs) = line.split_once(" - ")?;
             let mount_point = mount.split(' ').nth(4)?;
-            let fs_type = fs.split(' ').next()?;
-            Some((PathBuf::from(unescape(mount_point)), fs_type.to_owned()))
+            let mut fs = fs.split(' ');
+            let fs_type = fs.next()?;
+            let source = fs.next()?;
+            Some(MountEntry {
+                mount_point: PathBuf::from(unescape(mount_point)),
+                fs_type: fs_type.to_owned(),
+                source: unescape(source).to_string_lossy().into_owned(),
+            })
         })
         .collect()
 }
@@ -222,8 +335,8 @@ mod tests {
         assert_eq!(
             parse_mountinfo(mountinfo),
             vec![
-                (PathBuf::from("/mnt/my dir"), "ext3".to_owned()),
-                (PathBuf::from("/proc"), "proc".to_owned()),
+                entry("/mnt/my dir", "ext3", "/dev/root"),
+                entry("/proc", "proc", "proc"),
             ]
         );
     }
@@ -233,7 +346,24 @@ mod tests {
         let mountinfo = "100 1 0:50 / /d rw shared:5 master:2 - fuse.bindfs bindfs rw\n";
         assert_eq!(
             parse_mountinfo(mountinfo),
-            vec![(PathBuf::from("/d"), "fuse.bindfs".to_owned())]
+            vec![entry("/d", "fuse.bindfs", "bindfs")]
         );
+    }
+
+    #[test]
+    fn mountinfo_source_of_a_view() {
+        let mountinfo = "304 420 0:58 / /tmp/t/d rw,nosuid,nodev,relatime - fuse vm-herd-fs rw,user_id=0,group_id=0,default_permissions,allow_other\n";
+        assert_eq!(
+            parse_mountinfo(mountinfo),
+            vec![entry("/tmp/t/d", "fuse", "vm-herd-fs")]
+        );
+    }
+
+    fn entry(mount_point: &str, fs_type: &str, source: &str) -> MountEntry {
+        MountEntry {
+            mount_point: mount_point.into(),
+            fs_type: fs_type.into(),
+            source: source.into(),
+        }
     }
 }

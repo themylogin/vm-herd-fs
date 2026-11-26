@@ -19,7 +19,7 @@ use crate::nodes::{Key, Node, Nodes, ROOT_ID};
 
 const TTL: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Squash {
     pub uid: u32,
@@ -32,7 +32,7 @@ pub struct Overlay {
 }
 
 pub struct Config {
-    pub src: Arc<OwnedFd>,
+    pub src: Option<Arc<OwnedFd>>,
     pub overlay: Option<Overlay>,
     pub squash: Option<Squash>,
 }
@@ -45,7 +45,10 @@ impl Config {
     }
 
     fn is_project(&self, name: &OsStr) -> Res<bool> {
-        match rustix::fs::statat(&*self.src, name, AtFlags::SYMLINK_NOFOLLOW) {
+        let Some(src) = &self.src else {
+            return Ok(self.overlay_has_project(name));
+        };
+        match rustix::fs::statat(&**src, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => Ok(is_dir(&st)),
             Err(rustix::io::Errno::NOENT) => Ok(self.overlay_has_project(name)),
             Err(err) => Err(sys(err)),
@@ -53,10 +56,13 @@ impl Config {
     }
 
     fn is_overlay_only_project(&self, name: &OsStr) -> bool {
-        matches!(
-            rustix::fs::statat(&*self.src, name, AtFlags::SYMLINK_NOFOLLOW),
-            Err(rustix::io::Errno::NOENT)
-        ) && self.overlay_has_project(name)
+        let in_src = self.src.as_ref().is_some_and(|src| {
+            !matches!(
+                rustix::fs::statat(&**src, name, AtFlags::SYMLINK_NOFOLLOW),
+                Err(rustix::io::Errno::NOENT)
+            )
+        });
+        !in_src && self.overlay_has_project(name)
     }
 
     fn overlay_has_project(&self, name: &OsStr) -> bool {
@@ -67,7 +73,19 @@ impl Config {
     }
 
     fn project_backing(&self, name: &OsStr) -> Option<OwnedFd> {
-        open_dir_path(&*self.src, name).ok()
+        self.src
+            .as_ref()
+            .and_then(|src| open_dir_path(&**src, name).ok())
+    }
+
+    fn root_stat(&self) -> Res<Stat> {
+        if let Some(src) = &self.src {
+            return rustix::fs::fstat(&**src).map_err(sys);
+        }
+        let overlay = self.overlay.as_ref().ok_or(Errno::ENOENT)?;
+        let mut st = rustix::fs::fstat(&*overlay.src).map_err(sys)?;
+        st.st_mode = libc::S_IFDIR | 0o755;
+        Ok(st)
     }
 
     fn project_stat(&self, name: &OsStr) -> Res<(Option<OwnedFd>, Stat)> {
@@ -213,7 +231,8 @@ impl View {
                 if config.is_project(name)? {
                     self.project_attr(&config, name)?
                 } else {
-                    self.real_entry(&config, &*config.src, name)?
+                    let src = config.src.as_ref().ok_or(Errno::ENOENT)?;
+                    self.real_entry(&config, &**src, name)?
                 }
             }
             Node::Project(project) => {
@@ -234,10 +253,7 @@ impl View {
     fn getattr(&self, id: u64) -> Res<FileAttr> {
         let config = self.config();
         match self.node(id)? {
-            Node::Root => {
-                let st = rustix::fs::fstat(&*config.src).map_err(sys)?;
-                Ok(attr(ROOT_ID, &st, config.squash))
-            }
+            Node::Root => Ok(attr(ROOT_ID, &config.root_stat()?, config.squash)),
             Node::Project(name) => self.project_attr(&config, &name),
             Node::Real(fd) => {
                 let st = rustix::fs::fstat(&*fd).map_err(sys)?;
@@ -249,7 +265,7 @@ impl View {
     /// The backing object that metadata changes and xattrs apply to.
     fn backing(&self, config: &Config, id: u64) -> Res<Arc<OwnedFd>> {
         match self.node(id)? {
-            Node::Root => Ok(config.src.clone()),
+            Node::Root => config.src.clone().ok_or(Errno::EROFS),
             Node::Project(name) => config
                 .project_backing(&name)
                 .map(Arc::new)
@@ -260,7 +276,7 @@ impl View {
 
     fn existing_dir(&self, config: &Config, parent: &Node) -> Res<Arc<OwnedFd>> {
         match parent {
-            Node::Root => Ok(config.src.clone()),
+            Node::Root => config.src.clone().ok_or(Errno::ENOENT),
             Node::Project(name) => config
                 .project_backing(name)
                 .map(Arc::new)
@@ -271,6 +287,7 @@ impl View {
 
     fn creatable_dir(&self, config: &Config, parent: &Node, name: &OsStr) -> Res<Arc<OwnedFd>> {
         match parent {
+            Node::Root => config.src.clone().ok_or(Errno::EROFS),
             Node::Project(project) if config.is_overlay_name(name) => {
                 config.overlay_parent(project).map(Arc::new)
             }
@@ -501,17 +518,19 @@ impl View {
     }
 
     fn root_entries(&self, config: &Config) -> Res<Vec<DirEntry>> {
-        let dev = device(&config.src)?;
         let mut entries = vec![dot(".", ROOT_ID), dot("..", ROOT_ID)];
         let mut names = HashSet::new();
         let mut nodes = lock(&self.nodes);
-        for entry in list(&config.src)? {
-            names.insert(entry.name.clone());
-            let id = match entry.kind {
-                FileType::Directory => nodes.project_id(&entry.name),
-                _ => nodes.id_for_key((dev, entry.id)),
-            };
-            entries.push(DirEntry { id, ..entry });
+        if let Some(src) = &config.src {
+            let dev = device(src)?;
+            for entry in list(src)? {
+                names.insert(entry.name.clone());
+                let id = match entry.kind {
+                    FileType::Directory => nodes.project_id(&entry.name),
+                    _ => nodes.id_for_key((dev, entry.id)),
+                };
+                entries.push(DirEntry { id, ..entry });
+            }
         }
         if let Some(overlay) = &config.overlay {
             for entry in list(&overlay.src)? {
@@ -556,7 +575,13 @@ impl View {
     }
 
     fn statfs(&self) -> Res<rustix::fs::StatVfs> {
-        rustix::fs::fstatvfs(&*self.config().src).map_err(sys)
+        let config = self.config();
+        let dir = match (&config.src, &config.overlay) {
+            (Some(src), _) => src,
+            (None, Some(overlay)) => &overlay.src,
+            (None, None) => return Err(Errno::ENOENT),
+        };
+        rustix::fs::fstatvfs(&**dir).map_err(sys)
     }
 
     fn xattr_target(&self, id: u64) -> Res<Arc<OwnedFd>> {

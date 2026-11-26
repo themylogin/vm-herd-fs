@@ -12,31 +12,45 @@ use tempfile::TempDir;
 pub struct Daemon {
     child: Child,
     port: u16,
+    data_dir: PathBuf,
     mounted: Vec<PathBuf>,
+    _own_data_dir: Option<TempDir>,
 }
 
 impl Daemon {
     pub fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
-            .args(["--listen", "127.0.0.1:0"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let port = line
-            .trim()
-            .rsplit(':')
-            .next()
-            .and_then(|port| port.parse().ok())
-            .unwrap_or_else(|| panic!("no port in {line:?}"));
+        let own = tempfile::tempdir().unwrap();
+        let mut daemon = Self::start_in(own.path());
+        daemon._own_data_dir = Some(own);
+        daemon
+    }
+
+    pub fn start_in(data_dir: &Path) -> Self {
+        let (child, port) = spawn(data_dir);
         Self {
             child,
             port,
+            data_dir: data_dir.to_owned(),
             mounted: vec![],
+            _own_data_dir: None,
         }
+    }
+
+    /// Kills the daemon with SIGKILL, which leaves its mounts dead, and starts it again on
+    /// the same data directory.
+    pub fn restart(&mut self) {
+        self.kill();
+        let (child, port) = spawn(&self.data_dir);
+        self.child = child;
+        self.port = port;
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn track(&mut self, dst: &Path) {
+        self.mounted.push(dst.to_owned());
     }
 
     pub fn post(&self, path: &str, body: &str) -> (u16, String) {
@@ -93,12 +107,42 @@ impl Daemon {
     }
 }
 
+fn spawn(data_dir: &Path) -> (Child, u16) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
+        .args(["--listen", "127.0.0.1:0", "--data-dir"])
+        .arg(data_dir)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let port = line
+        .trim()
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("no port in {line:?}"));
+    (child, port)
+}
+
+pub fn run_daemon(args: &[&std::ffi::OsStr]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.kill();
         for dst in &self.mounted {
-            if is_mount_point(dst) {
-                let _ = Command::new("umount").arg("-l").arg(dst).status();
+            while is_mount_point(dst) {
+                let detached = Command::new("umount").arg("-l").arg(dst).status();
+                if !detached.is_ok_and(|status| status.success()) {
+                    break;
+                }
             }
         }
     }

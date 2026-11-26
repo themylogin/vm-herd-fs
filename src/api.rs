@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Request, Response, Server};
 
@@ -16,7 +16,7 @@ pub struct MountParams {
     pub squash: Option<Squash>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayParams {
     pub src: PathBuf,
@@ -43,10 +43,9 @@ impl From<MountError> for RpcError {
     }
 }
 
-pub fn serve(listen: &str) -> Result<(), String> {
+pub fn serve(listen: &str, mut registry: Registry) -> Result<(), String> {
     let server = Server::http(listen).map_err(|err| format!("listen on {listen}: {err}"))?;
     println!("listening on {}", server.server_addr());
-    let mut registry = Registry::default();
     for mut request in server.incoming_requests() {
         let response = handle(&mut registry, &mut request);
         if let Err(err) = request.respond(response) {

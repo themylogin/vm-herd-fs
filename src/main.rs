@@ -1,8 +1,10 @@
 mod api;
 mod mounts;
 mod nodes;
+mod state;
 mod view;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -14,6 +16,8 @@ use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 struct Args {
     #[arg(long, value_name = "HOST:PORT")]
     listen: String,
+    #[arg(long, value_name = "DIR")]
+    data_dir: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -31,7 +35,20 @@ fn main() -> ExitCode {
     ) {
         eprintln!("raise the open file limit: {err}");
     }
-    match api::serve(&args.listen) {
+    if let Err(err) = std::fs::create_dir_all(&args.data_dir) {
+        eprintln!("create {}: {err}", args.data_dir.display());
+        return ExitCode::FAILURE;
+    }
+    let stored = match state::load(&args.data_dir) {
+        Ok(stored) => stored,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut registry = mounts::Registry::new(args.data_dir, stored);
+    registry.restore();
+    match api::serve(&args.listen, registry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
