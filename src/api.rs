@@ -16,6 +16,14 @@ pub struct MountParams {
     pub squash: Option<Squash>,
 }
 
+#[derive(Serialize)]
+pub struct MountsItem {
+    pub src: Option<PathBuf>,
+    pub overlay: Option<OverlayParams>,
+    pub dst: PathBuf,
+    pub squash: Option<Squash>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UmountParams {
@@ -93,6 +101,7 @@ fn call(registry: &mut Registry, body: &str) -> Value {
     let result = match method {
         "mount" => mount(registry, params),
         "umount" => umount(registry, params),
+        "mounts" => mounts(registry, &params),
         _ => Err(RpcError {
             code: -32601,
             message: "Method not found".into(),
@@ -120,6 +129,22 @@ fn umount(registry: &mut Registry, params: Value) -> Result<Value, RpcError> {
     })?;
     registry.umount(&params.dst)?;
     Ok(Value::Null)
+}
+
+fn mounts(registry: &Registry, params: &Value) -> Result<Value, RpcError> {
+    let empty = match params {
+        Value::Null => true,
+        Value::Object(fields) => fields.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    };
+    if !empty {
+        return Err(RpcError {
+            code: -32602,
+            message: "mounts takes no params".into(),
+        });
+    }
+    Ok(json!(registry.mounts()))
 }
 
 fn error_reply(id: Value, code: i64, message: String) -> Value {

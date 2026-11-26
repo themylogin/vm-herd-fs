@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
@@ -9,9 +9,9 @@ use std::sync::Arc;
 use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
 use rustix::fs::{Mode, OFlags};
 
-use crate::api::{MountParams, OverlayParams};
+use crate::api::{MountParams, MountsItem, OverlayParams};
 use crate::state::{self, StoredMount};
-use crate::view::{Config, Fs, Invalidation, Overlay, View};
+use crate::view::{Config, Fs, Invalidation, Overlay, Squash, View};
 
 pub enum MountError {
     InvalidParams(String),
@@ -30,11 +30,19 @@ struct Mounted {
     _session: BackgroundSession,
     notifier: Notifier,
     view: Arc<View>,
+    shown: Shown,
+}
+
+#[derive(Clone)]
+struct Shown {
+    src: Option<PathBuf>,
+    overlay: Option<OverlayParams>,
+    squash: Option<Squash>,
 }
 
 pub struct Registry {
     data_dir: PathBuf,
-    mounts: HashMap<PathBuf, Mounted>,
+    mounts: BTreeMap<PathBuf, Mounted>,
     stored: BTreeMap<PathBuf, StoredMount>,
 }
 
@@ -42,7 +50,7 @@ impl Registry {
     pub fn new(data_dir: PathBuf, stored: Vec<StoredMount>) -> Self {
         Self {
             data_dir,
-            mounts: HashMap::new(),
+            mounts: BTreeMap::new(),
             stored: stored
                 .into_iter()
                 .map(|item| (item.dst.clone(), item))
@@ -76,7 +84,23 @@ impl Registry {
                 entry.fs_type
             )));
         }
-        self.attach(item.dst.clone(), restored_config(item)?)
+        self.attach(
+            item.dst.clone(),
+            restored_config(item)?,
+            restored_shown(item),
+        )
+    }
+
+    pub fn mounts(&self) -> Vec<MountsItem> {
+        self.mounts
+            .iter()
+            .map(|(dst, mounted)| MountsItem {
+                src: mounted.shown.src.clone(),
+                overlay: mounted.shown.overlay.clone(),
+                dst: dst.clone(),
+                squash: mounted.shown.squash,
+            })
+            .collect()
     }
 
     pub fn umount(&mut self, dst: &Path) -> Result<(), MountError> {
@@ -88,12 +112,13 @@ impl Registry {
         }
         let not_served = || MountError::Failed(format!("dst {} is not served", dst.display()));
         let dst = std::fs::canonicalize(dst).map_err(|_| not_served())?;
-        let mounted = self.mounts.get(&dst).ok_or_else(not_served)?;
+        let mounted = self.mounts.get_mut(&dst).ok_or_else(not_served)?;
         if let Some(item) = self.stored.get(&dst) {
             invalidate(
                 &mounted.notifier,
                 mounted.view.replace(restored_config(item)?),
             );
+            mounted.shown = restored_shown(item);
             return Ok(());
         }
         rustix::mount::unmount(&dst, rustix::mount::UnmountFlags::DETACH)
@@ -139,8 +164,14 @@ impl Registry {
             squash: params.squash,
         };
 
-        if let Some(mounted) = self.mounts.get(&dst) {
+        let shown = Shown {
+            src: Some(params.src.clone()),
+            overlay: params.overlay.clone(),
+            squash: params.squash,
+        };
+        if let Some(mounted) = self.mounts.get_mut(&dst) {
             invalidate(&mounted.notifier, mounted.view.replace(config));
+            mounted.shown = shown;
         } else {
             if let Some(entry) = foreign_mount(&dst)? {
                 return Err(MountError::Failed(format!(
@@ -149,7 +180,7 @@ impl Registry {
                     entry.fs_type
                 )));
             }
-            self.attach(dst.clone(), config)?;
+            self.attach(dst.clone(), config, shown)?;
         }
         self.store(dst, params.overlay, params.squash)
     }
@@ -158,7 +189,7 @@ impl Registry {
         &mut self,
         dst: PathBuf,
         overlay: Option<OverlayParams>,
-        squash: Option<crate::view::Squash>,
+        squash: Option<Squash>,
     ) -> Result<(), MountError> {
         match overlay {
             Some(overlay) => {
@@ -177,7 +208,7 @@ impl Registry {
             .map_err(|err| MountError::Failed(format!("write the state file: {err}")))
     }
 
-    fn attach(&mut self, dst: PathBuf, config: Config) -> Result<(), MountError> {
+    fn attach(&mut self, dst: PathBuf, config: Config, shown: Shown) -> Result<(), MountError> {
         let view = Arc::new(View::new(config));
         let mut options = fuser::Config::default();
         options.mount_options = vec![
@@ -197,6 +228,7 @@ impl Registry {
                 _session: session,
                 notifier,
                 view,
+                shown,
             },
         );
         Ok(())
@@ -220,6 +252,14 @@ fn restored_config(item: &StoredMount) -> Result<Config, MountError> {
         }),
         squash: item.squash,
     })
+}
+
+fn restored_shown(item: &StoredMount) -> Shown {
+    Shown {
+        src: None,
+        overlay: Some(item.overlay.clone()),
+        squash: item.squash,
+    }
 }
 
 fn existing_dir(param: &str, path: &Path) -> Result<PathBuf, MountError> {

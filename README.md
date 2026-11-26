@@ -68,7 +68,7 @@ to change the host. A `mount` call for a `dst` with another mount at or below it
 |---|---|
 | `-32700` | The body is not JSON. |
 | `-32600` | The body is not a JSON-RPC 2.0 request. |
-| `-32601` | The method is not `mount` or `umount`. |
+| `-32601` | The method is not `mount`, `umount`, or `mounts`. |
 | `-32602` | A param is wrong. The message names it. |
 | `-32000` | The call failed, for example because of a foreign mount at `dst`, or `umount` for a `dst` that is not served. |
 
@@ -91,6 +91,30 @@ curl -s http://127.0.0.1:8742/api -d '{
 
 `umount` does not change `state.json`. For a `dst` that the daemon does not serve, it fails
 with `-32000`.
+
+### mounts
+
+The method `mounts` takes no params and lists the views that the daemon serves, sorted by
+`dst`:
+
+```sh
+curl -s http://127.0.0.1:8742/api -d '{"jsonrpc": "2.0", "id": 3, "method": "mounts"}'
+```
+
+```json
+{"id": 3, "jsonrpc": "2.0", "result": [
+  {
+    "src": "/home/user/Dev/.vm-herd/truenas/workdir/192.168.2.130",
+    "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+    "dst": "/home/user/Dev/truenas",
+    "squash": {"uid": 1000, "gid": 1000}
+  }
+]}
+```
+
+Each item has the form of the `mount` params, with the config that the view shows now. `src`
+is `null` for a restored view, after a daemon start or after `umount`. Params other than none,
+`null`, `{}`, or `[]` fail with `-32602`.
 
 ## Changes made outside the view
 
