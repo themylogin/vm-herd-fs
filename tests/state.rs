@@ -71,12 +71,9 @@ fn mount_with_overlay() {
         json!({"version": 1, "mounts": [{
             "type": "cattle",
             "dst": tree.path("d"),
-            "overlay": {
-                "individual": {"src": tree.path("overlay"), "directories": [".idea"]},
-                "shared": {"src": tree.path("shared")},
-            },
+            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
             "squash": {"uid": 1000, "gid": 1000},
-        }]})
+        }], "binds": []})
     );
 }
 
@@ -92,8 +89,38 @@ fn pet_mount() {
             "dst": tree.path("d"),
             "src": tree.path("h1"),
             "squash": {"uid": 1000, "gid": 1000},
-        }]})
+        }], "binds": []})
     );
+}
+
+#[test]
+fn pet_mount_with_a_shared_overlay() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    let before = state(&daemon);
+    let mut params = tree.pet_params("h1", "d");
+    params["overlay"] = json!({"shared": {"src": tree.path("shared")}});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert_eq!(state(&daemon), before);
+}
+
+#[test]
+fn pet_item_without_overlay_key() {
+    let tree = Tree::new();
+    let data_dir = tree.path("data");
+    fs::create_dir(&data_dir).unwrap();
+    let stored = json!({"version": 1, "mounts": [{
+        "type": "pet",
+        "dst": tree.path("d"),
+        "src": tree.path("h1"),
+        "squash": null,
+    }], "binds": []});
+    fs::write(data_dir.join("state.json"), stored.to_string()).unwrap();
+    let mut daemon = Daemon::start_in(&data_dir);
+    daemon.track(&tree.path("d"));
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj3"]);
 }
 
 #[test]
@@ -136,6 +163,29 @@ fn restart_with_a_pet() {
 }
 
 #[test]
+fn restart_with_a_shared_pet() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.bind_ok(tree.bind_params("h1"));
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    daemon.restart();
+    assert_eq!(
+        names(&tree.path("d")),
+        ["notes.md", "proj1", "proj3", "tools"]
+    );
+    fs::write(tree.path("d/notes.md"), "after a restart").unwrap();
+    assert_eq!(
+        fs::read_to_string(tree.path("shared/notes.md")).unwrap(),
+        "after a restart"
+    );
+    fs::write(tree.path("d/proj1/main.py"), "after a restart").unwrap();
+    assert_eq!(
+        fs::read_to_string(tree.path("h1/proj1/main.py")).unwrap(),
+        "after a restart"
+    );
+}
+
+#[test]
 fn pet_src_missing_at_start() {
     let tree = Tree::new();
     let data_dir = tree.path("data");
@@ -145,7 +195,7 @@ fn pet_src_missing_at_start() {
         "dst": tree.path("d"),
         "src": tree.path("gone"),
         "squash": null,
-    }]});
+    }], "binds": []});
     fs::write(data_dir.join("state.json"), stored.to_string()).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
         .args(["--listen", "127.0.0.1:0", "--data-dir"])
@@ -187,16 +237,11 @@ fn pet_src_missing_at_start() {
 fn restart_with_shared_only() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
-    let mut params = tree.params("h1", "d");
-    params["overlay"] = json!({"shared": {"src": tree.path("shared")}});
-    daemon.mount_ok(params);
-    assert_eq!(
-        state(&daemon)["mounts"][0]["overlay"],
-        json!({"individual": null, "shared": {"src": tree.path("shared")}})
-    );
+    daemon.bind_ok(tree.bind_params("h1"));
+    daemon.mount_ok(tree.params("h1", "d"));
     daemon.restart();
-    assert_eq!(names(&tree.path("d")), ["notes.md", "tools"]);
-    fs::write(tree.path("d/notes.md"), "after a restart").unwrap();
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
+    fs::write(tree.path("h1/notes.md"), "after a restart").unwrap();
     assert_eq!(
         fs::read_to_string(tree.path("shared/notes.md")).unwrap(),
         "after a restart"
@@ -259,18 +304,11 @@ fn restart_with_an_overlay() {
     assert!(status.success());
     assert!(!is_mount_point(&tree.path("d")));
     daemon.restart();
-    assert_eq!(
-        names(&tree.path("d")),
-        ["notes.md", "proj1", "proj2", "proj3", "tools"]
-    );
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
     assert_eq!(names(&tree.path("d/proj1")), [".idea"]);
     assert_eq!(
         fs::read_to_string(tree.path("d/proj1/.idea/workspace.xml")).unwrap(),
         "proj1"
-    );
-    assert_eq!(
-        fs::read_to_string(tree.path("d/notes.md")).unwrap(),
-        "shared notes\n"
     );
     assert_eq!(
         fs::metadata(tree.path("d/proj1/.idea")).unwrap().uid(),
@@ -284,10 +322,7 @@ fn restart_after_a_crash() {
     let mut daemon = Daemon::start();
     daemon.mount_ok(tree.params("h1", "d"));
     daemon.restart();
-    assert_eq!(
-        names(&tree.path("d")),
-        ["notes.md", "proj1", "proj2", "proj3", "tools"]
-    );
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
     assert_eq!(names(&tree.path("d/proj3")), [".idea"]);
     let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
     let at_dst = mounts
@@ -348,10 +383,7 @@ fn foreign_mount_at_a_stored_dst() {
         .unwrap();
     assert!(status.success());
     daemon.restart();
-    assert_eq!(
-        names(&tree.path("d")),
-        ["notes.md", "proj1", "proj2", "proj3", "tools"]
-    );
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
     assert_eq!(fs_type(&tree.path("d2")).as_deref(), Some("tmpfs"));
     let mounts = state(&daemon)["mounts"].as_array().unwrap().clone();
     assert!(

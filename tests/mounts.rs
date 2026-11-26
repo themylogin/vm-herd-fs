@@ -38,10 +38,7 @@ fn mounted_host() {
         json!([{
             "type": "cattle",
             "src": tree.path("h1"),
-            "overlay": {
-                "individual": {"src": tree.path("overlay"), "directories": [".idea"]},
-                "shared": {"src": tree.path("shared")},
-            },
+            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -82,10 +79,7 @@ fn restored_view_after_a_restart() {
         json!([{
             "type": "cattle",
             "src": null,
-            "overlay": {
-                "individual": {"src": tree.path("overlay"), "directories": [".idea"]},
-                "shared": {"src": tree.path("shared")},
-            },
+            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -111,6 +105,25 @@ fn pet_after_a_restart() {
 }
 
 #[test]
+fn shared_pet_after_a_restart() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.bind_ok(tree.bind_params("h1"));
+    daemon.mount_ok(tree.pet_params("h1", "d"));
+    daemon.restart();
+    assert_eq!(
+        mounts(&daemon),
+        json!([{
+            "type": "pet",
+            "src": tree.path("h1"),
+            "overlay": null,
+            "dst": tree.path("d"),
+            "squash": {"uid": 1000, "gid": 1000},
+        }])
+    );
+}
+
+#[test]
 fn restored_view_after_umount() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
@@ -120,10 +133,7 @@ fn restored_view_after_umount() {
     let result = mounts(&daemon);
     assert_eq!(result.as_array().unwrap().len(), 1);
     assert_eq!(result[0]["src"], Value::Null);
-    assert_eq!(
-        result[0]["overlay"]["individual"]["src"],
-        json!(tree.path("overlay"))
-    );
+    assert_eq!(result[0]["overlay"]["src"], json!(tree.path("overlay")));
 }
 
 #[test]

@@ -73,10 +73,7 @@ fn back_to_the_restored_view() {
     assert_eq!(reply["result"], Value::Null, "{reply}");
     assert!(reply.get("error").is_none(), "{reply}");
     assert!(is_mount_point(&tree.path("d")));
-    assert_eq!(
-        names(&tree.path("d")),
-        ["notes.md", "proj1", "proj2", "proj3", "tools"]
-    );
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
     assert_eq!(names(&tree.path("d/proj1")), [".idea"]);
     assert_eq!(
         fs::metadata(tree.path("d/proj1/.idea")).unwrap().ino(),

@@ -39,14 +39,14 @@ fn main() -> ExitCode {
         eprintln!("create {}: {err}", args.data_dir.display());
         return ExitCode::FAILURE;
     }
-    let stored = match state::load(&args.data_dir) {
-        Ok(stored) => stored,
+    let (stored, stored_binds) = match state::load(&args.data_dir) {
+        Ok(state) => state,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::FAILURE;
         }
     };
-    let mut registry = mounts::Registry::new(args.data_dir, stored);
+    let mut registry = mounts::Registry::new(args.data_dir, stored, stored_binds);
     registry.restore();
     match api::serve(&args.listen, registry) {
         Ok(()) => ExitCode::SUCCESS,

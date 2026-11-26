@@ -41,24 +41,24 @@ struct UmountParams {
     dst: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindParams {
+    pub src: PathBuf,
+    pub dst: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnbindParams {
+    dst: PathBuf,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayParams {
-    pub individual: Option<IndividualParams>,
-    pub shared: Option<SharedParams>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndividualParams {
     pub src: PathBuf,
     pub directories: Vec<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SharedParams {
-    pub src: PathBuf,
 }
 
 struct RpcError {
@@ -126,6 +126,9 @@ fn call(registry: &mut Registry, body: &str) -> Value {
         "mount" => mount(registry, params),
         "umount" => umount(registry, params),
         "mounts" => mounts(registry, &params),
+        "bind" => bind(registry, params),
+        "unbind" => unbind(registry, params),
+        "binds" => binds(registry, &params),
         _ => Err(RpcError {
             code: -32601,
             message: "Method not found".into(),
@@ -155,7 +158,35 @@ fn umount(registry: &mut Registry, params: Value) -> Result<Value, RpcError> {
     Ok(Value::Null)
 }
 
+fn bind(registry: &mut Registry, params: Value) -> Result<Value, RpcError> {
+    let params: BindParams = serde_json::from_value(params).map_err(|err| RpcError {
+        code: -32602,
+        message: err.to_string(),
+    })?;
+    registry.bind(params)?;
+    Ok(Value::Null)
+}
+
+fn unbind(registry: &mut Registry, params: Value) -> Result<Value, RpcError> {
+    let params: UnbindParams = serde_json::from_value(params).map_err(|err| RpcError {
+        code: -32602,
+        message: err.to_string(),
+    })?;
+    registry.unbind(&params.dst)?;
+    Ok(Value::Null)
+}
+
 fn mounts(registry: &Registry, params: &Value) -> Result<Value, RpcError> {
+    no_params("mounts", params)?;
+    Ok(json!(registry.mounts()))
+}
+
+fn binds(registry: &Registry, params: &Value) -> Result<Value, RpcError> {
+    no_params("binds", params)?;
+    Ok(json!(registry.binds()))
+}
+
+fn no_params(method: &str, params: &Value) -> Result<(), RpcError> {
     let empty = match params {
         Value::Null => true,
         Value::Object(fields) => fields.is_empty(),
@@ -165,10 +196,10 @@ fn mounts(registry: &Registry, params: &Value) -> Result<Value, RpcError> {
     if !empty {
         return Err(RpcError {
             code: -32602,
-            message: "mounts takes no params".into(),
+            message: format!("{method} takes no params"),
         });
     }
-    Ok(json!(registry.mounts()))
+    Ok(())
 }
 
 fn error_reply(id: Value, code: i64, message: String) -> Value {

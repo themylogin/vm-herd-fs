@@ -22,6 +22,13 @@ pub enum StoredMount {
     },
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredBind {
+    pub src: PathBuf,
+    pub dst: PathBuf,
+}
+
 impl StoredMount {
     pub fn dst(&self) -> &Path {
         match self {
@@ -35,6 +42,7 @@ impl StoredMount {
 struct State {
     version: u32,
     mounts: Vec<StoredMount>,
+    binds: Vec<StoredBind>,
 }
 
 #[derive(Deserialize)]
@@ -42,11 +50,11 @@ struct Version {
     version: u32,
 }
 
-pub fn load(data_dir: &Path) -> Result<Vec<StoredMount>, String> {
+pub fn load(data_dir: &Path) -> Result<(Vec<StoredMount>, Vec<StoredBind>), String> {
     let path = data_dir.join("state.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(vec![]),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((vec![], vec![])),
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
     let Version { version } =
@@ -59,13 +67,17 @@ pub fn load(data_dir: &Path) -> Result<Vec<StoredMount>, String> {
     }
     let state: State =
         serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
-    Ok(state.mounts)
+    Ok((state.mounts, state.binds))
 }
 
 /// Writes a temporary file and renames it over `state.json`, so a crash never leaves a
 /// partly written file.
-pub fn save(data_dir: &Path, mounts: Vec<StoredMount>) -> io::Result<()> {
-    let state = State { version: 1, mounts };
+pub fn save(data_dir: &Path, mounts: Vec<StoredMount>, binds: Vec<StoredBind>) -> io::Result<()> {
+    let state = State {
+        version: 1,
+        mounts,
+        binds,
+    };
     let temporary = data_dir.join("state.json.tmp");
     let mut file = File::create(&temporary)?;
     file.write_all(&serde_json::to_vec_pretty(&state)?)?;
@@ -76,7 +88,6 @@ pub fn save(data_dir: &Path, mounts: Vec<StoredMount>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{IndividualParams, SharedParams};
 
     fn write(dir: &Path, text: &str) {
         std::fs::write(dir.join("state.json"), text).unwrap();
@@ -85,7 +96,9 @@ mod tests {
     #[test]
     fn missing_file_means_no_mounts() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load(dir.path()).unwrap().is_empty());
+        let (mounts, binds) = load(dir.path()).unwrap();
+        assert!(mounts.is_empty());
+        assert!(binds.is_empty());
     }
 
     #[test]
@@ -93,9 +106,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
-            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"individual": {"src": "/w/overlay", "directories": [".idea"]}, "shared": {"src": "/w/shared"}}, "squash": {"uid": 1000, "gid": 1000}}]}"#,
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"src": "/w/overlay", "directories": [".idea"]}, "squash": {"uid": 1000, "gid": 1000}}], "binds": []}"#,
         );
-        let mounts = load(dir.path()).unwrap();
+        let (mounts, _) = load(dir.path()).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].dst(), Path::new("/d"));
         let StoredMount::Cattle {
@@ -104,10 +117,8 @@ mod tests {
         else {
             panic!("not a cattle item");
         };
-        let individual = overlay.individual.as_ref().unwrap();
-        assert_eq!(individual.directories, [".idea"]);
-        let shared = overlay.shared.as_ref().unwrap();
-        assert_eq!(shared.src, Path::new("/w/shared"));
+        assert_eq!(overlay.src, Path::new("/w/overlay"));
+        assert_eq!(overlay.directories, [".idea"]);
         assert_eq!(
             *squash,
             Some(Squash {
@@ -122,9 +133,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
-            r#"{"version": 1, "mounts": [{"type": "pet", "dst": "/d", "src": "/w/h1", "squash": null}]}"#,
+            r#"{"version": 1, "mounts": [{"type": "pet", "dst": "/d", "src": "/w/h1", "squash": null}], "binds": []}"#,
         );
-        let mounts = load(dir.path()).unwrap();
+        let (mounts, _) = load(dir.path()).unwrap();
         assert_eq!(mounts[0].dst(), Path::new("/d"));
         let StoredMount::Pet { src, squash, .. } = &mounts[0] else {
             panic!("not a pet item");
@@ -134,11 +145,30 @@ mod tests {
     }
 
     #[test]
+    fn pet_item_with_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            r#"{"version": 1, "mounts": [{"type": "pet", "dst": "/d", "src": "/w/h1", "overlay": null, "squash": null}], "binds": []}"#,
+        );
+        let err = load(dir.path()).err().unwrap();
+        assert!(err.contains("unknown field `overlay`"), "{err}");
+    }
+
+    #[test]
+    fn file_without_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), r#"{"version": 1, "mounts": []}"#);
+        let err = load(dir.path()).err().unwrap();
+        assert!(err.contains("`binds`"), "{err}");
+    }
+
+    #[test]
     fn item_without_type() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
-            r#"{"version": 1, "mounts": [{"dst": "/d", "src": "/w/h1", "squash": null}]}"#,
+            r#"{"version": 1, "mounts": [{"dst": "/d", "src": "/w/h1", "squash": null}], "binds": []}"#,
         );
         let err = load(dir.path()).err().unwrap();
         assert!(err.contains("`type`"), "{err}");
@@ -149,36 +179,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
-            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "src": "/w/h1", "overlay": {"shared": {"src": "/w/shared"}}, "squash": null}]}"#,
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "src": "/w/h1", "overlay": {"src": "/w/overlay", "directories": []}, "squash": null}], "binds": []}"#,
         );
         let err = load(dir.path()).err().unwrap();
         assert!(err.contains("unknown field `src`"), "{err}");
     }
 
     #[test]
-    fn overlay_without_members() {
+    fn overlay_with_members() {
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
-            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"src": "/w/overlay", "directories": [".idea"]}, "squash": null}]}"#,
+            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"individual": {"src": "/w/overlay", "directories": [".idea"]}}, "squash": null}], "binds": []}"#,
         );
         let err = load(dir.path()).err().unwrap();
-        assert!(err.contains("unknown field `src`"), "{err}");
-    }
-
-    #[test]
-    fn omitted_members_are_null() {
-        let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            r#"{"version": 1, "mounts": [{"type": "cattle", "dst": "/d", "overlay": {"shared": {"src": "/w/shared"}}, "squash": null}]}"#,
-        );
-        let mounts = load(dir.path()).unwrap();
-        let StoredMount::Cattle { overlay, .. } = &mounts[0] else {
-            panic!("not a cattle item");
-        };
-        assert!(overlay.individual.is_none());
-        assert!(overlay.shared.is_some());
+        assert!(err.contains("unknown field `individual`"), "{err}");
     }
 
     #[test]
@@ -202,13 +217,8 @@ mod tests {
         let cattle = StoredMount::Cattle {
             dst: "/d".into(),
             overlay: OverlayParams {
-                individual: Some(IndividualParams {
-                    src: "/w/overlay".into(),
-                    directories: vec![".idea".into()],
-                }),
-                shared: Some(SharedParams {
-                    src: "/w/shared".into(),
-                }),
+                src: "/w/overlay".into(),
+                directories: vec![".idea".into()],
             },
             squash: None,
         };
@@ -220,13 +230,19 @@ mod tests {
                 gid: 1000,
             }),
         };
-        save(dir.path(), vec![cattle, pet]).unwrap();
+        let bind = StoredBind {
+            src: "/w/shared".into(),
+            dst: "/w/h1".into(),
+        };
+        save(dir.path(), vec![cattle, pet], vec![bind]).unwrap();
         assert!(!dir.path().join("state.json.tmp").exists());
         let text = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
         assert!(text.contains(r#""type": "cattle""#), "{text}");
         assert!(text.contains(r#""type": "pet""#), "{text}");
-        let mounts = load(dir.path()).unwrap();
+        let (mounts, binds) = load(dir.path()).unwrap();
         assert_eq!(mounts[0].dst(), Path::new("/d"));
         assert!(matches!(&mounts[1], StoredMount::Pet { src, .. } if src == Path::new("/w/h1")));
+        assert_eq!(binds[0].src, Path::new("/w/shared"));
+        assert_eq!(binds[0].dst, Path::new("/w/h1"));
     }
 }

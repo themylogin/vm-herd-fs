@@ -26,50 +26,25 @@ pub struct Squash {
     pub gid: u32,
 }
 
-pub struct Individual {
+pub struct Overlay {
     pub src: Arc<OwnedFd>,
     pub directories: Vec<OsString>,
 }
 
-pub struct Shared {
-    pub src: Arc<OwnedFd>,
-}
-
 pub struct Config {
     pub src: Option<Arc<OwnedFd>>,
-    pub individual: Option<Individual>,
-    pub shared: Option<Shared>,
+    pub overlay: Option<Overlay>,
     pub squash: Option<Squash>,
 }
 
 impl Config {
     fn is_overlay_name(&self, name: &OsStr) -> bool {
-        self.individual
+        self.overlay
             .as_ref()
-            .is_some_and(|individual| individual.directories.iter().any(|item| item == name))
-    }
-
-    fn shared_entry(&self, name: &OsStr) -> Res<Option<OwnedFd>> {
-        let Some(shared) = &self.shared else {
-            return Ok(None);
-        };
-        match open_path(&*shared.src, name) {
-            Ok(fd) => Ok(Some(fd)),
-            Err(rustix::io::Errno::NOENT) => Ok(None),
-            Err(err) => Err(sys(err)),
-        }
-    }
-
-    fn shared_has(&self, name: &OsStr) -> bool {
-        self.shared.as_ref().is_some_and(|shared| {
-            rustix::fs::statat(&*shared.src, name, AtFlags::SYMLINK_NOFOLLOW).is_ok()
-        })
+            .is_some_and(|overlay| overlay.directories.iter().any(|item| item == name))
     }
 
     fn is_project(&self, name: &OsStr) -> Res<bool> {
-        if self.shared_has(name) {
-            return Ok(false);
-        }
         let Some(src) = &self.src else {
             return Ok(self.overlay_has_project(name));
         };
@@ -91,17 +66,16 @@ impl Config {
     }
 
     fn overlay_has_project(&self, name: &OsStr) -> bool {
-        self.individual.as_ref().is_some_and(|individual| {
-            rustix::fs::statat(&*individual.src, name, AtFlags::SYMLINK_NOFOLLOW)
+        self.overlay.as_ref().is_some_and(|overlay| {
+            rustix::fs::statat(&*overlay.src, name, AtFlags::SYMLINK_NOFOLLOW)
                 .is_ok_and(|st| is_dir(&st))
         })
     }
 
     fn overlay_root(&self) -> Res<&Arc<OwnedFd>> {
-        self.individual
+        self.overlay
             .as_ref()
-            .map(|individual| &individual.src)
-            .or(self.shared.as_ref().map(|shared| &shared.src))
+            .map(|overlay| &overlay.src)
             .ok_or(Errno::ENOENT)
     }
 
@@ -125,18 +99,18 @@ impl Config {
             let st = rustix::fs::fstat(&backing).map_err(sys)?;
             return Ok((Some(backing), st));
         }
-        let individual = self.individual.as_ref().ok_or(Errno::ENOENT)?;
-        let fd = open_dir_path(&*individual.src, name).map_err(|_| Errno::ENOENT)?;
+        let overlay = self.overlay.as_ref().ok_or(Errno::ENOENT)?;
+        let fd = open_dir_path(&*overlay.src, name).map_err(|_| Errno::ENOENT)?;
         let mut st = rustix::fs::fstat(&fd).map_err(sys)?;
         st.st_mode = libc::S_IFDIR | 0o755;
         Ok((None, st))
     }
 
     fn overlay_entry(&self, project: &OsStr, name: &OsStr) -> Res<Option<OwnedFd>> {
-        let Some(individual) = &self.individual else {
+        let Some(overlay) = &self.overlay else {
             return Ok(None);
         };
-        let project_fd = match open_dir_path(&*individual.src, project) {
+        let project_fd = match open_dir_path(&*overlay.src, project) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => return Ok(None),
             Err(err) => return Err(sys(err)),
@@ -149,13 +123,13 @@ impl Config {
     }
 
     fn overlay_parent(&self, project: &OsStr) -> Res<OwnedFd> {
-        let individual = self.individual.as_ref().ok_or(Errno::ENOENT)?;
+        let overlay = self.overlay.as_ref().ok_or(Errno::ENOENT)?;
         ignore_exists(rustix::fs::mkdirat(
-            &*individual.src,
+            &*overlay.src,
             project,
             Mode::from_raw_mode(0o755),
         ))?;
-        open_dir_path(&*individual.src, project).map_err(sys)
+        open_dir_path(&*overlay.src, project).map_err(sys)
     }
 }
 
@@ -260,9 +234,7 @@ impl View {
         let parent_node = self.node(parent)?;
         let attr = match &parent_node {
             Node::Root => {
-                if let Some(fd) = config.shared_entry(name)? {
-                    self.remember(&config, fd)?
-                } else if config.is_project(name)? {
+                if config.is_project(name)? {
                     self.project_attr(&config, name)?
                 } else {
                     let src = config.src.as_ref().ok_or(Errno::ENOENT)?;
@@ -336,7 +308,7 @@ impl View {
     fn check_fixed(config: &Config, parent: &Node, name: &OsStr) -> Res<()> {
         let fixed = match parent {
             Node::Project(_) => config.is_overlay_name(name),
-            Node::Root => config.is_overlay_only_project(name) || config.shared_has(name),
+            Node::Root => config.is_overlay_only_project(name),
             Node::Real(_) => false,
         };
         if fixed { Err(Errno::EPERM) } else { Ok(()) }
@@ -555,14 +527,6 @@ impl View {
         let mut entries = vec![dot(".", ROOT_ID), dot("..", ROOT_ID)];
         let mut names = HashSet::new();
         let mut nodes = lock(&self.nodes);
-        if let Some(shared) = &config.shared {
-            let dev = device(&shared.src)?;
-            for entry in list(&shared.src)? {
-                names.insert(entry.name.clone());
-                let id = nodes.id_for_key((dev, entry.id));
-                entries.push(DirEntry { id, ..entry });
-            }
-        }
         if let Some(src) = &config.src {
             let dev = device(src)?;
             for entry in list(src)? {
@@ -576,8 +540,8 @@ impl View {
                 entries.push(DirEntry { id, ..entry });
             }
         }
-        if let Some(individual) = &config.individual {
-            for entry in list(&individual.src)? {
+        if let Some(overlay) = &config.overlay {
+            for entry in list(&overlay.src)? {
                 if entry.kind == FileType::Directory && !names.contains(&entry.name) {
                     let id = nodes.project_id(&entry.name);
                     entries.push(DirEntry { id, ..entry });
@@ -592,8 +556,8 @@ impl View {
         if let Some(backing) = config.project_backing(project) {
             entries.extend(self.dir_entries(&backing, |name| config.is_overlay_name(name))?);
         }
-        if let Some(individual) = &config.individual {
-            for name in &individual.directories {
+        if let Some(overlay) = &config.overlay {
+            for name in &overlay.directories {
                 if let Some(fd) = config.overlay_entry(project, name)? {
                     let st = rustix::fs::fstat(&fd).map_err(sys)?;
                     entries.push(DirEntry {

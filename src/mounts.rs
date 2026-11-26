@@ -3,15 +3,17 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
-use rustix::fs::{Gid, Mode, OFlags, Uid};
+use rustix::fs::{CWD, Gid, Mode, OFlags, Uid};
+use rustix::mount::{MoveMountFlags, OpenTreeFlags, UnmountFlags};
 
-use crate::api::{MountParams, MountType, MountsItem, OverlayParams};
-use crate::state::{self, StoredMount};
-use crate::view::{Config, Fs, Individual, Invalidation, Shared, Squash, View};
+use crate::api::{BindParams, MountParams, MountType, MountsItem, OverlayParams};
+use crate::state::{self, StoredBind, StoredMount};
+use crate::view::{Config, Fs, Invalidation, Overlay, Squash, View};
 
 pub enum MountError {
     InvalidParams(String),
@@ -33,6 +35,13 @@ struct Mounted {
     shown: Shown,
 }
 
+#[derive(Clone, PartialEq)]
+struct Bind {
+    point: PathBuf,
+    entry: PathBuf,
+    dir: bool,
+}
+
 #[derive(Clone)]
 struct Shown {
     type_: MountType,
@@ -45,10 +54,12 @@ pub struct Registry {
     data_dir: PathBuf,
     mounts: BTreeMap<PathBuf, Mounted>,
     stored: BTreeMap<PathBuf, StoredMount>,
+    binds: BTreeMap<PathBuf, Vec<Bind>>,
+    stored_binds: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Registry {
-    pub fn new(data_dir: PathBuf, stored: Vec<StoredMount>) -> Self {
+    pub fn new(data_dir: PathBuf, stored: Vec<StoredMount>, stored_binds: Vec<StoredBind>) -> Self {
         Self {
             data_dir,
             mounts: BTreeMap::new(),
@@ -56,10 +67,25 @@ impl Registry {
                 .into_iter()
                 .map(|item| (item.dst().to_owned(), item))
                 .collect(),
+            binds: BTreeMap::new(),
+            stored_binds: stored_binds
+                .into_iter()
+                .map(|item| (item.dst, item.src))
+                .collect(),
         }
     }
 
     pub fn restore(&mut self) {
+        let pairs: Vec<(PathBuf, PathBuf)> = self
+            .stored_binds
+            .iter()
+            .map(|(dst, src)| (dst.clone(), src.clone()))
+            .collect();
+        for (dst, src) in pairs {
+            if let Err(reason) = self.apply_bind(&dst, &src) {
+                eprintln!("bind {}: skipped: {reason}", dst.display());
+            }
+        }
         let items: Vec<StoredMount> = self.stored.values().cloned().collect();
         for item in items {
             if let Err(reason) = self.restore_item(&item) {
@@ -73,7 +99,7 @@ impl Registry {
         while let Some(earlier) = mount_entries()?.into_iter().find(|entry| {
             entry.mount_point == dst && entry.fs_type == "fuse" && entry.source == "vm-herd-fs"
         }) {
-            rustix::mount::unmount(&earlier.mount_point, rustix::mount::UnmountFlags::DETACH)
+            rustix::mount::unmount(&earlier.mount_point, UnmountFlags::DETACH)
                 .map_err(|err| MountError::Failed(format!("detach the earlier mount: {err}")))?;
         }
         if !dst.is_dir() {
@@ -129,7 +155,7 @@ impl Registry {
             }
             None => {}
         }
-        rustix::mount::unmount(&dst, rustix::mount::UnmountFlags::DETACH)
+        rustix::mount::unmount(&dst, UnmountFlags::DETACH)
             .map_err(|err| MountError::Failed(format!("unmount {}: {err}", dst.display())))?;
         let mounted = self.mounts.remove(&dst).ok_or_else(not_served)?;
         // fuser waits up to 5 seconds for open files when it drops a session.
@@ -145,36 +171,21 @@ impl Registry {
                 "overlay is not allowed for type pet".into(),
             ));
         }
-        let individual = match params
-            .overlay
-            .as_ref()
-            .and_then(|overlay| overlay.individual.as_ref())
-        {
-            Some(individual) => {
-                for name in &individual.directories {
+        let overlay = match &params.overlay {
+            Some(overlay) => {
+                for name in &overlay.directories {
                     check_name(name)?;
                 }
                 Some((
-                    existing_dir("overlay.individual.src", &individual.src)?,
-                    &individual.directories,
+                    existing_dir("overlay.src", &overlay.src)?,
+                    &overlay.directories,
                 ))
             }
             None => None,
         };
-        let shared = match params
-            .overlay
-            .as_ref()
-            .and_then(|overlay| overlay.shared.as_ref())
-        {
-            Some(shared) => Some(existing_dir("overlay.shared.src", &shared.src)?),
-            None => None,
-        };
         check_apart(&dst, "src", &src)?;
-        if let Some((individual_src, _)) = &individual {
-            check_apart(&dst, "overlay.individual.src", individual_src)?;
-        }
-        if let Some(shared_src) = &shared {
-            check_apart(&dst, "overlay.shared.src", shared_src)?;
+        if let Some((overlay_src, _)) = &overlay {
+            check_apart(&dst, "overlay.src", overlay_src)?;
         }
         for served in self.mounts.keys().filter(|served| **served != dst) {
             check_apart(&dst, "a served dst", served)?;
@@ -182,16 +193,8 @@ impl Registry {
 
         let config = Config {
             src: Some(open_dir(&src)?),
-            individual: match individual {
-                Some((individual_src, directories)) => {
-                    Some(open_individual(&individual_src, directories)?)
-                }
-                None => None,
-            },
-            shared: match shared {
-                Some(shared_src) => Some(Shared {
-                    src: open_dir(&shared_src)?,
-                }),
+            overlay: match overlay {
+                Some((overlay_src, directories)) => Some(open_overlay(&overlay_src, directories)?),
                 None => None,
             },
             squash: params.squash,
@@ -244,8 +247,81 @@ impl Registry {
                 self.stored.remove(&dst);
             }
         }
-        state::save(&self.data_dir, self.stored.values().cloned().collect())
-            .map_err(|err| MountError::Failed(format!("write the state file: {err}")))
+        self.save()
+    }
+
+    pub fn binds(&self) -> Vec<StoredBind> {
+        self.stored_binds
+            .iter()
+            .map(|(dst, src)| StoredBind {
+                src: src.clone(),
+                dst: dst.clone(),
+            })
+            .collect()
+    }
+
+    fn save(&self) -> Result<(), MountError> {
+        state::save(
+            &self.data_dir,
+            self.stored.values().cloned().collect(),
+            self.binds(),
+        )
+        .map_err(|err| MountError::Failed(format!("write the state file: {err}")))
+    }
+
+    pub fn bind(&mut self, params: BindParams) -> Result<(), MountError> {
+        let src = existing_dir("src", &params.src)?;
+        let dst = existing_dir("dst", &params.dst)?;
+        self.apply_bind(&dst, &src)?;
+        self.stored_binds.insert(dst, src);
+        self.save()
+    }
+
+    /// Makes the bind mounts in `dst` match the entries that `src` holds now.
+    fn apply_bind(&mut self, dst: &Path, src: &Path) -> Result<(), MountError> {
+        let wanted = shared_binds(dst, src)?;
+        let known = self.binds.remove(dst).unwrap_or_default();
+        let (kept, unwanted): (Vec<Bind>, Vec<Bind>) =
+            known.into_iter().partition(|bind| wanted.contains(bind));
+        let (replaced, stale): (Vec<Bind>, Vec<Bind>) = unwanted
+            .into_iter()
+            .partition(|old| wanted.iter().any(|bind| bind.point == old.point));
+        // A bind mount on a point that already holds one would stack, and a later detach by
+        // path would remove the new one.
+        remove_binds(&replaced);
+        let missing: Vec<Bind> = wanted
+            .iter()
+            .filter(|bind| !kept.contains(bind) && !is_bound(bind))
+            .cloned()
+            .collect();
+        if let Err(err) = add_binds(&missing) {
+            self.binds
+                .insert(dst.to_owned(), kept.into_iter().chain(stale).collect());
+            return Err(err);
+        }
+        remove_binds(&stale);
+        self.binds.insert(dst.to_owned(), wanted);
+        Ok(())
+    }
+
+    pub fn unbind(&mut self, dst: &Path) -> Result<(), MountError> {
+        if !dst.is_absolute() {
+            return Err(MountError::InvalidParams(format!(
+                "dst must be an absolute path, got {}",
+                dst.display()
+            )));
+        }
+        // A dst that vm-herd already deleted no longer resolves, but its stored item must go.
+        let dst = std::fs::canonicalize(dst).unwrap_or_else(|_| dst.to_owned());
+        if !self.binds.contains_key(&dst) && !self.stored_binds.contains_key(&dst) {
+            return Err(MountError::Failed(format!(
+                "dst {} is not bound",
+                dst.display()
+            )));
+        }
+        remove_binds(&self.binds.remove(&dst).unwrap_or_default());
+        self.stored_binds.remove(&dst);
+        self.save()
     }
 
     fn attach(&mut self, dst: PathBuf, config: Config, shown: Shown) -> Result<(), MountError> {
@@ -279,40 +355,26 @@ fn restored_config(item: &StoredMount) -> Result<Config, MountError> {
     match item {
         StoredMount::Pet { src, squash, .. } => Ok(Config {
             src: Some(open_dir(src)?),
-            individual: None,
-            shared: None,
+            overlay: None,
             squash: *squash,
         }),
         StoredMount::Cattle {
             overlay, squash, ..
         } => {
-            let individual = match &overlay.individual {
-                Some(individual) => {
-                    for name in &individual.directories {
-                        check_name(name)?;
-                    }
-                    Some(open_individual(&individual.src, &individual.directories)?)
-                }
-                None => None,
-            };
-            let shared = match &overlay.shared {
-                Some(shared) => Some(Shared {
-                    src: open_dir(&shared.src)?,
-                }),
-                None => None,
-            };
+            for name in &overlay.directories {
+                check_name(name)?;
+            }
             Ok(Config {
                 src: None,
-                individual,
-                shared,
+                overlay: Some(open_overlay(&overlay.src, &overlay.directories)?),
                 squash: *squash,
             })
         }
     }
 }
 
-fn open_individual(src: &Path, directories: &[String]) -> Result<Individual, MountError> {
-    Ok(Individual {
+fn open_overlay(src: &Path, directories: &[String]) -> Result<Overlay, MountError> {
+    Ok(Overlay {
         src: open_dir(src)?,
         directories: directories.iter().map(OsString::from).collect(),
     })
@@ -381,24 +443,147 @@ fn dst_dir(path: &Path) -> Result<PathBuf, MountError> {
 }
 
 fn create_dst(dst: &Path, squash: Option<Squash>) -> Result<(), MountError> {
-    let failed =
-        |err: rustix::io::Errno| MountError::Failed(format!("create dst {}: {err}", dst.display()));
-    rustix::fs::mkdir(dst, Mode::from_raw_mode(0o755)).map_err(failed)?;
+    create_owned(dst, true, squash)
+        .map_err(|err| MountError::Failed(format!("create dst {}: {err}", dst.display())))
+}
+
+fn create_owned(path: &Path, dir: bool, squash: Option<Squash>) -> rustix::io::Result<()> {
+    if dir {
+        rustix::fs::mkdir(path, Mode::from_raw_mode(0o755))?;
+    } else {
+        rustix::fs::open(
+            path,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+    }
     if let Some(squash) = squash {
         rustix::fs::chown(
-            dst,
+            path,
             Some(Uid::from_raw(squash.uid)),
             Some(Gid::from_raw(squash.gid)),
-        )
-        .map_err(failed)?;
+        )?;
     }
     Ok(())
+}
+
+/// Every check runs here, before the caller creates a mount point or adds a bind mount.
+fn shared_binds(dst: &Path, src: &Path) -> Result<Vec<Bind>, MountError> {
+    let failed =
+        |path: &Path, reason: String| MountError::Failed(format!("{}: {reason}", path.display()));
+    let entries = std::fs::read_dir(src).map_err(|err| failed(src, err.to_string()))?;
+    let mut binds = vec![];
+    for entry in entries {
+        let entry = entry.map_err(|err| failed(src, err.to_string()))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|err| failed(&path, err.to_string()))?;
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(failed(&path, "is not a file or a directory".into()));
+        }
+        let point = dst.join(entry.file_name());
+        match std::fs::symlink_metadata(&point) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(failed(&point, "is a symlink".into()));
+            }
+            Ok(meta) if meta.is_dir() != kind.is_dir() => {
+                return Err(failed(
+                    &point,
+                    format!("is not of the same kind as {}", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(failed(&point, err.to_string())),
+        }
+        binds.push(Bind {
+            point,
+            entry: path,
+            dir: kind.is_dir(),
+        });
+    }
+    binds.sort_by(|a, b| a.point.cmp(&b.point));
+    Ok(binds)
+}
+
+/// On a failure, removes the bind mounts that this call added. Created mount points stay.
+fn add_binds(binds: &[Bind]) -> Result<(), MountError> {
+    for (done, bind) in binds.iter().enumerate() {
+        if let Err(err) = add_bind(bind) {
+            remove_binds(&binds[..done]);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn add_bind(bind: &Bind) -> Result<(), MountError> {
+    let failed = |err: rustix::io::Errno| {
+        MountError::Failed(format!(
+            "bind {} at {}: {err}",
+            bind.entry.display(),
+            bind.point.display()
+        ))
+    };
+    if std::fs::symlink_metadata(&bind.point).is_err() {
+        create_owned(&bind.point, bind.dir, None).map_err(failed)?;
+    }
+    let tree = rustix::mount::open_tree(
+        CWD,
+        &bind.entry,
+        OpenTreeFlags::OPEN_TREE_CLONE
+            | OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | OpenTreeFlags::AT_SYMLINK_NOFOLLOW,
+    )
+    .map_err(failed)?;
+    // Without MOVE_MOUNT_T_SYMLINKS, a symlink put at the point after the checks fails the
+    // call instead of moving the bind mount outside src.
+    rustix::mount::move_mount(
+        &tree,
+        "",
+        CWD,
+        &bind.point,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .map_err(failed)
+}
+
+fn remove_binds(binds: &[Bind]) {
+    for bind in binds {
+        if let Err(err) = detach(&bind.point) {
+            eprintln!("detach {}: {err}", bind.point.display());
+        }
+    }
+}
+
+fn detach(point: &Path) -> rustix::io::Result<()> {
+    rustix::mount::unmount(point, UnmountFlags::DETACH)?;
+    // The removes fail on a non-empty directory and on a point that still holds a mount,
+    // which keeps both.
+    match std::fs::symlink_metadata(point) {
+        Ok(meta) if meta.is_dir() => drop(std::fs::remove_dir(point)),
+        Ok(meta) if meta.is_file() && meta.len() == 0 => drop(std::fs::remove_file(point)),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A bind mount that an earlier run left shows the inode of the store entry.
+fn is_bound(bind: &Bind) -> bool {
+    match (
+        std::fs::symlink_metadata(&bind.point),
+        std::fs::symlink_metadata(&bind.entry),
+    ) {
+        (Ok(point), Ok(entry)) => point.dev() == entry.dev() && point.ino() == entry.ino(),
+        _ => false,
+    }
 }
 
 fn check_name(name: &str) -> Result<(), MountError> {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
         return Err(MountError::InvalidParams(format!(
-            "overlay.individual.directories item {name:?} must be a plain name"
+            "overlay.directories item {name:?} must be a plain name"
         )));
     }
     Ok(())

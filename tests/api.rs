@@ -156,14 +156,11 @@ fn name_with_a_slash() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
     let mut params = tree.params("h1", "d");
-    params["overlay"]["individual"]["directories"] = json!(["a/b"]);
+    params["overlay"]["directories"] = json!(["a/b"]);
     let reply = daemon.mount(params);
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
     let message = reply["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("overlay.individual.directories"),
-        "{message}"
-    );
+    assert!(message.contains("overlay.directories"), "{message}");
 }
 
 #[test]
@@ -171,7 +168,9 @@ fn overlay_without_members() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
     let mut params = tree.params("h1", "d");
-    params["overlay"] = json!({"src": tree.path("overlay"), "directories": [".idea"]});
+    params["overlay"] = json!({
+        "individual": {"src": tree.path("overlay"), "directories": [".idea"]},
+    });
     let reply = daemon.mount(params);
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
     assert!(!is_mount_point(&tree.path("d")));
@@ -180,13 +179,11 @@ fn overlay_without_members() {
 #[test]
 fn relative_shared_src() {
     let tree = Tree::new();
-    let mut daemon = Daemon::start();
-    let mut params = tree.params("h1", "d");
-    params["overlay"]["shared"] = json!({"src": "w/shared"});
-    let reply = daemon.mount(params);
+    let daemon = Daemon::start();
+    let reply = daemon.call("bind", json!({"src": "w/shared", "dst": tree.path("h1")}));
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
     let message = reply["error"]["message"].as_str().unwrap();
-    assert!(message.contains("overlay.shared.src"), "{message}");
+    assert!(message.contains("src"), "{message}");
 }
 
 #[test]
@@ -218,11 +215,22 @@ fn pet_with_an_overlay() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
     let mut params = tree.pet_params("h1", "d");
-    params["overlay"] = json!({"shared": {"src": tree.path("shared")}});
+    params["overlay"] = json!({"src": tree.path("overlay"), "directories": [".idea"]});
     let reply = daemon.mount(params);
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
     let message = reply["error"]["message"].as_str().unwrap();
     assert!(message.contains("overlay"), "{message}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn pet_with_a_shared_overlay() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.pet_params("h1", "d");
+    params["overlay"] = json!({"shared": {"src": tree.path("shared")}});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
     assert!(!is_mount_point(&tree.path("d")));
 }
 

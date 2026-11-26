@@ -101,6 +101,12 @@ impl Daemon {
         assert!(reply.get("error").is_none(), "{reply}");
     }
 
+    pub fn bind_ok(&self, params: Value) {
+        let reply = self.call("bind", params);
+        assert_eq!(reply["result"], Value::Null, "{reply}");
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -152,6 +158,37 @@ pub struct Tree {
     pub dir: TempDir,
 }
 
+/// Bind mounts in `src` outlive the daemon, and a mount point blocks the removal of the
+/// temporary directory.
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let root = self.dir.path().to_str().unwrap().to_owned();
+        loop {
+            let mut points: Vec<String> = fs::read_to_string("/proc/self/mountinfo")
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split(' ').nth(4))
+                .filter(|point| point.starts_with(&format!("{root}/")))
+                .map(str::to_owned)
+                .collect();
+            if points.is_empty() {
+                break;
+            }
+            points.sort_by_key(|point| std::cmp::Reverse(point.len()));
+            let detached = points.iter().filter(|point| {
+                Command::new("umount")
+                    .arg("-l")
+                    .arg(point)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
+            if detached.count() == 0 {
+                break;
+            }
+        }
+    }
+}
+
 impl Tree {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -188,10 +225,7 @@ impl Tree {
         json!({
             "type": "cattle",
             "src": self.path(host),
-            "overlay": {
-                "individual": {"src": self.path("overlay"), "directories": [".idea"]},
-                "shared": {"src": self.path("shared")},
-            },
+            "overlay": {"src": self.path("overlay"), "directories": [".idea"]},
             "dst": self.path(dst),
             "squash": {"uid": 1000, "gid": 1000},
         })
@@ -207,6 +241,10 @@ impl Tree {
             "squash": {"uid": 1000, "gid": 1000},
         })
     }
+
+    pub fn bind_params(&self, host: &str) -> Value {
+        json!({"src": self.path("shared"), "dst": self.path(host)})
+    }
 }
 
 pub fn names(dir: &Path) -> Vec<String> {
@@ -216,6 +254,14 @@ pub fn names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+pub fn mount_count(path: &Path) -> usize {
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some(path.to_str().unwrap()))
+        .count()
 }
 
 pub fn is_mount_point(path: &Path) -> bool {
