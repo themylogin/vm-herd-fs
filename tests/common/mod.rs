@@ -1,0 +1,178 @@
+#![allow(dead_code)]
+
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+pub struct Daemon {
+    child: Child,
+    port: u16,
+    mounted: Vec<PathBuf>,
+}
+
+impl Daemon {
+    pub fn start() -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
+            .args(["--listen", "127.0.0.1:0"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port = line
+            .trim()
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {line:?}"));
+        Self {
+            child,
+            port,
+            mounted: vec![],
+        }
+    }
+
+    pub fn post(&self, path: &str, body: &str) -> (u16, String) {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        let mut response = agent
+            .post(format!("http://127.0.0.1:{}{path}", self.port))
+            .content_type("application/json")
+            .send(body)
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.body_mut().read_to_string().unwrap())
+    }
+
+    pub fn get(&self, path: &str) -> u16 {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        let response = agent
+            .get(format!("http://127.0.0.1:{}{path}", self.port))
+            .call()
+            .unwrap();
+        response.status().as_u16()
+    }
+
+    pub fn call(&self, method: &str, params: Value) -> Value {
+        let body = json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1});
+        let (status, reply) = self.post("/api", &body.to_string());
+        assert_eq!(status, 200, "{reply}");
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    pub fn mount(&mut self, params: Value) -> Value {
+        let reply = self.call("mount", params.clone());
+        if reply.get("error").is_none() {
+            self.mounted
+                .push(PathBuf::from(params["dst"].as_str().unwrap()));
+        }
+        reply
+    }
+
+    pub fn mount_ok(&mut self, params: Value) {
+        let reply = self.mount(params);
+        assert_eq!(reply["result"], Value::Null, "{reply}");
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.kill();
+        for dst in &self.mounted {
+            if is_mount_point(dst) {
+                let _ = Command::new("umount").arg("-l").arg(dst).status();
+            }
+        }
+    }
+}
+
+pub struct Tree {
+    pub dir: TempDir,
+}
+
+impl Tree {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let tree = Self { dir };
+        for (host, project) in [
+            ("h1", "proj1"),
+            ("h1", "proj3"),
+            ("h2", "proj1"),
+            ("h2", "proj2"),
+        ] {
+            let path = tree.path(&format!("{host}/{project}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("main.py"), format!("{host} {project}\n")).unwrap();
+        }
+        for project in ["proj1", "proj2", "proj3"] {
+            let idea = tree.path(&format!("overlay/{project}/.idea"));
+            fs::create_dir_all(&idea).unwrap();
+            fs::write(idea.join("workspace.xml"), project).unwrap();
+        }
+        fs::create_dir_all(tree.path("d")).unwrap();
+        fs::create_dir_all(tree.path("d2")).unwrap();
+        tree
+    }
+
+    pub fn path(&self, relative: &str) -> PathBuf {
+        self.dir.path().join(relative)
+    }
+
+    pub fn params(&self, host: &str, dst: &str) -> Value {
+        json!({
+            "src": self.path(host),
+            "overlay": {"src": self.path("overlay"), "directories": [".idea"]},
+            "dst": self.path(dst),
+            "squash": {"uid": 1000, "gid": 1000},
+        })
+    }
+}
+
+pub fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+pub fn is_mount_point(path: &Path) -> bool {
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .any(|line| line.split(' ').nth(4) == Some(path.to_str().unwrap()))
+}
+
+pub fn as_user(uid: u32, script: &str) -> Output {
+    Command::new("setpriv")
+        .args([
+            &format!("--reuid={uid}"),
+            &format!("--regid={uid}"),
+            "--clear-groups",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .unwrap()
+}

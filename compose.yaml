@@ -1,0 +1,22 @@
+x-rust: &rust
+  build: .
+  volumes:
+    - .:/app
+    - cargo-registry:/usr/local/cargo/registry
+    - target:/app/target
+
+services:
+  check:
+    <<: *rust
+    profiles: [check]
+    command: sh -c "cargo fmt --check && cargo clippy --all-targets -- -D warnings"
+
+  test:
+    <<: *rust
+    profiles: [test]
+    privileged: true
+    command: cargo test
+
+volumes:
+  cargo-registry:
+  target:
