@@ -1,9 +1,22 @@
 mod common;
 
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::process::Command;
 
 use common::{Daemon, Tree, is_mount_point, names};
-use serde_json::json;
+use serde_json::{Value, json};
+
+fn without_overlay(tree: &Tree, host: &str, dst: &str) -> Value {
+    let mut params = tree.params(host, dst);
+    params["overlay"] = json!(null);
+    params
+}
+
+fn umount(daemon: &Daemon, tree: &Tree, dst: &str) {
+    let reply = daemon.call("umount", json!({"dst": tree.path(dst)}));
+    assert!(reply.get("error").is_none(), "{reply}");
+}
 
 #[test]
 fn successful_mount() {
@@ -64,12 +77,69 @@ fn relative_path() {
 #[test]
 fn dst_inside_src() {
     let tree = Tree::new();
-    std::fs::create_dir(tree.path("h1/view")).unwrap();
     let mut daemon = Daemon::start();
     let reply = daemon.mount(tree.params("h1", "h1/view"));
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(!tree.path("h1/view").exists());
     let reply = daemon.mount(tree.params("h1", "overlay/proj1"));
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
+}
+
+#[test]
+fn dst_with_a_missing_parent() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let reply = daemon.mount(tree.params("h1", "missing/d"));
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(!tree.path("missing").exists());
+}
+
+#[test]
+fn dst_is_a_file() {
+    let tree = Tree::new();
+    fs::write(tree.path("f"), "").unwrap();
+    let mut daemon = Daemon::start();
+    let reply = daemon.mount(tree.params("h1", "f"));
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(tree.path("f").is_file());
+}
+
+#[test]
+fn missing_dst_with_squash() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    assert!(!tree.path("d3").exists());
+    daemon.mount_ok(without_overlay(&tree, "h1", "d3"));
+    assert!(is_mount_point(&tree.path("d3")));
+    assert_eq!(names(&tree.path("d3")), ["proj1", "proj3"]);
+    umount(&daemon, &tree, "d3");
+    let meta = fs::metadata(tree.path("d3")).unwrap();
+    assert!(meta.is_dir());
+    assert_eq!((meta.uid(), meta.gid()), (1000, 1000));
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o755);
+}
+
+#[test]
+fn missing_dst_without_squash() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = without_overlay(&tree, "h1", "d3");
+    params["squash"] = json!(null);
+    daemon.mount_ok(params);
+    umount(&daemon, &tree, "d3");
+    let meta = fs::metadata(tree.path("d3")).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (0, 0));
+}
+
+#[test]
+fn existing_dst_keeps_its_owner() {
+    let tree = Tree::new();
+    chown(tree.path("d"), Some(1001), Some(1001)).unwrap();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(without_overlay(&tree, "h1", "d"));
+    umount(&daemon, &tree, "d");
+    let meta = fs::metadata(tree.path("d")).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (1001, 1001));
 }
 
 #[test]

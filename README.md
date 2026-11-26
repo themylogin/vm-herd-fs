@@ -63,11 +63,12 @@ On success, the result is `null`.
 | `overlay.individual.directories` | Names such as `.idea`. `dst/<project>/<name>` shows `overlay.individual.src/<project>/<name>` when it exists. A create of `dst/<project>/<name>` creates it there. The same names in `src` stay hidden and untouched. |
 | `overlay.shared` | `null`, or the store for entries at the root of `dst`. Absent means `null`. |
 | `overlay.shared.src` | Each file and directory in it shows at the root of `dst` and is writable. An entry of the same name in `src`, a project directory included, stays hidden and untouched. The entries cannot be removed or renamed; entries inside a shared directory can. |
-| `dst` | The mount point. |
+| `dst` | The mount point. When it does not exist, the daemon creates it with mode `0755`. With `squash`, the new directory gets owner `squash.uid:squash.gid`. An existing `dst` stays as it is. |
 | `squash` | `null`, or `{"uid", "gid"}`. With `squash`, every file shows as `uid:gid`, new files get owner 0:0 on disk, and chown changes nothing on disk. Without it, files show their real owners and new files belong to the caller. |
 
-All paths must be absolute paths of existing directories. `dst` must not overlap `src`,
-`overlay.individual.src`, `overlay.shared.src`, or another served `dst`.
+All paths must be absolute. `src` and the overlay stores must be existing directories. `dst`
+may be missing when its parent exists. `dst` must not overlap `src`, `overlay.individual.src`,
+`overlay.shared.src`, or another served `dst`.
 
 A pet mount:
 

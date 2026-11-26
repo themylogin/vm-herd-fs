@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{Gid, Mode, OFlags, Uid};
 
 use crate::api::{MountParams, MountType, MountsItem, OverlayParams};
 use crate::state::{self, StoredMount};
@@ -139,7 +139,7 @@ impl Registry {
 
     pub fn mount(&mut self, params: MountParams) -> Result<(), MountError> {
         let src = existing_dir("src", &params.src)?;
-        let dst = existing_dir("dst", &params.dst)?;
+        let dst = dst_dir(&params.dst)?;
         if params.type_ == MountType::Pet && params.overlay.is_some() {
             return Err(MountError::InvalidParams(
                 "overlay is not allowed for type pet".into(),
@@ -213,6 +213,9 @@ impl Registry {
                     entry.mount_point.display(),
                     entry.fs_type
                 )));
+            }
+            if !dst.exists() {
+                create_dst(&dst, params.squash)?;
             }
             self.attach(dst.clone(), config, shown)?;
         }
@@ -350,6 +353,46 @@ fn existing_dir(param: &str, path: &Path) -> Result<PathBuf, MountError> {
         )));
     }
     Ok(resolved)
+}
+
+/// A missing `dst` resolves through its parent, so the overlap checks see the path the
+/// create will use.
+fn dst_dir(path: &Path) -> Result<PathBuf, MountError> {
+    if path.exists() {
+        return existing_dir("dst", path);
+    }
+    if !path.is_absolute() {
+        return Err(MountError::InvalidParams(format!(
+            "dst must be an absolute path, got {}",
+            path.display()
+        )));
+    }
+    let wrong =
+        |reason: String| MountError::InvalidParams(format!("dst {}: {reason}", path.display()));
+    let name = path
+        .file_name()
+        .ok_or_else(|| wrong("has no name".into()))?;
+    let parent = path.parent().ok_or_else(|| wrong("has no parent".into()))?;
+    let parent = std::fs::canonicalize(parent).map_err(|err| wrong(err.to_string()))?;
+    if !parent.is_dir() {
+        return Err(wrong("parent is not a directory".into()));
+    }
+    Ok(parent.join(name))
+}
+
+fn create_dst(dst: &Path, squash: Option<Squash>) -> Result<(), MountError> {
+    let failed =
+        |err: rustix::io::Errno| MountError::Failed(format!("create dst {}: {err}", dst.display()));
+    rustix::fs::mkdir(dst, Mode::from_raw_mode(0o755)).map_err(failed)?;
+    if let Some(squash) = squash {
+        rustix::fs::chown(
+            dst,
+            Some(Uid::from_raw(squash.uid)),
+            Some(Gid::from_raw(squash.gid)),
+        )
+        .map_err(failed)?;
+    }
+    Ok(())
 }
 
 fn check_name(name: &str) -> Result<(), MountError> {
