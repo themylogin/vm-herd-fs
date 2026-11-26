@@ -68,9 +68,29 @@ to change the host. A `mount` call for a `dst` with another mount at or below it
 |---|---|
 | `-32700` | The body is not JSON. |
 | `-32600` | The body is not a JSON-RPC 2.0 request. |
-| `-32601` | The method is not `mount`. |
+| `-32601` | The method is not `mount` or `umount`. |
 | `-32602` | A param is wrong. The message names it. |
-| `-32000` | The mount failed, for example because of a foreign mount at `dst`. |
+| `-32000` | The call failed, for example because of a foreign mount at `dst`, or `umount` for a `dst` that is not served. |
+
+### umount
+
+The method `umount` puts a served `dst` into the state that a reboot and a daemon start produce:
+
+```sh
+curl -s http://127.0.0.1:8742/api -d '{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "umount",
+  "params": {"dst": "/home/user/Dev/truenas"}
+}'
+```
+
+- When `state.json` holds `dst`, the view changes in place to the restored view: every project
+  of `overlay.src` with only its overlay directories. The mount stays.
+- Otherwise, the daemon unmounts `dst`. Open files do not block the call.
+
+`umount` does not change `state.json`. For a `dst` that the daemon does not serve, it fails
+with `-32000`.
 
 ## Changes made outside the view
 

@@ -76,23 +76,32 @@ impl Registry {
                 entry.fs_type
             )));
         }
-        for name in &item.overlay.directories {
-            check_name(name)?;
+        self.attach(item.dst.clone(), restored_config(item)?)
+    }
+
+    pub fn umount(&mut self, dst: &Path) -> Result<(), MountError> {
+        if !dst.is_absolute() {
+            return Err(MountError::InvalidParams(format!(
+                "dst must be an absolute path, got {}",
+                dst.display()
+            )));
         }
-        let config = Config {
-            src: None,
-            overlay: Some(Overlay {
-                src: open_dir(&item.overlay.src)?,
-                directories: item
-                    .overlay
-                    .directories
-                    .iter()
-                    .map(OsString::from)
-                    .collect(),
-            }),
-            squash: item.squash,
-        };
-        self.attach(item.dst.clone(), config)
+        let not_served = || MountError::Failed(format!("dst {} is not served", dst.display()));
+        let dst = std::fs::canonicalize(dst).map_err(|_| not_served())?;
+        let mounted = self.mounts.get(&dst).ok_or_else(not_served)?;
+        if let Some(item) = self.stored.get(&dst) {
+            invalidate(
+                &mounted.notifier,
+                mounted.view.replace(restored_config(item)?),
+            );
+            return Ok(());
+        }
+        rustix::mount::unmount(&dst, rustix::mount::UnmountFlags::DETACH)
+            .map_err(|err| MountError::Failed(format!("unmount {}: {err}", dst.display())))?;
+        let mounted = self.mounts.remove(&dst).ok_or_else(not_served)?;
+        // fuser waits up to 5 seconds for open files when it drops a session.
+        std::thread::spawn(move || drop(mounted));
+        Ok(())
     }
 
     pub fn mount(&mut self, params: MountParams) -> Result<(), MountError> {
@@ -192,6 +201,25 @@ impl Registry {
         );
         Ok(())
     }
+}
+
+fn restored_config(item: &StoredMount) -> Result<Config, MountError> {
+    for name in &item.overlay.directories {
+        check_name(name)?;
+    }
+    Ok(Config {
+        src: None,
+        overlay: Some(Overlay {
+            src: open_dir(&item.overlay.src)?,
+            directories: item
+                .overlay
+                .directories
+                .iter()
+                .map(OsString::from)
+                .collect(),
+        }),
+        squash: item.squash,
+    })
 }
 
 fn existing_dir(param: &str, path: &Path) -> Result<PathBuf, MountError> {

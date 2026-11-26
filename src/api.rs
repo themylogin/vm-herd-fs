@@ -16,6 +16,12 @@ pub struct MountParams {
     pub squash: Option<Squash>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UmountParams {
+    dst: PathBuf,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayParams {
@@ -86,6 +92,7 @@ fn call(registry: &mut Registry, body: &str) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
         "mount" => mount(registry, params),
+        "umount" => umount(registry, params),
         _ => Err(RpcError {
             code: -32601,
             message: "Method not found".into(),
@@ -103,6 +110,15 @@ fn mount(registry: &mut Registry, params: Value) -> Result<Value, RpcError> {
         message: err.to_string(),
     })?;
     registry.mount(params)?;
+    Ok(Value::Null)
+}
+
+fn umount(registry: &mut Registry, params: Value) -> Result<Value, RpcError> {
+    let params: UmountParams = serde_json::from_value(params).map_err(|err| RpcError {
+        code: -32602,
+        message: err.to_string(),
+    })?;
+    registry.umount(&params.dst)?;
     Ok(Value::Null)
 }
 
