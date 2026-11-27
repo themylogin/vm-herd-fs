@@ -5,6 +5,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
@@ -550,10 +551,21 @@ fn add_bind(bind: &Bind) -> Result<(), MountError> {
 }
 
 fn remove_binds(binds: &[Bind]) {
+    if binds.is_empty() {
+        return;
+    }
     for bind in binds {
         if let Err(err) = detach(&bind.point) {
             eprintln!("detach {}: {err}", bind.point.display());
         }
+    }
+    // Every host directory binds the same store inode, so nfsd gives the bind mounts of all of
+    // them one file handle. Its cache keeps that handle on the detached mount, and clients of
+    // the other host directories hang until the cache is flushed.
+    match Command::new("exportfs").arg("-f").status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("exportfs -f: {status}"),
+        Err(err) => eprintln!("exportfs -f: {err}"),
     }
 }
 

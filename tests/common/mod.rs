@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -13,6 +14,7 @@ pub struct Daemon {
     child: Child,
     port: u16,
     data_dir: PathBuf,
+    path: Option<OsString>,
     mounted: Vec<PathBuf>,
     _own_data_dir: Option<TempDir>,
 }
@@ -26,11 +28,27 @@ impl Daemon {
     }
 
     pub fn start_in(data_dir: &Path) -> Self {
-        let (child, port) = spawn(data_dir);
+        Self::spawn_in(data_dir, None)
+    }
+
+    /// Starts the daemon with `bin` first in its PATH.
+    pub fn start_with_bin(bin: &Path) -> Self {
+        let own = tempfile::tempdir().unwrap();
+        let mut path = bin.as_os_str().to_owned();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap());
+        let mut daemon = Self::spawn_in(own.path(), Some(path));
+        daemon._own_data_dir = Some(own);
+        daemon
+    }
+
+    fn spawn_in(data_dir: &Path, path: Option<OsString>) -> Self {
+        let (child, port) = spawn(data_dir, path.as_deref());
         Self {
             child,
             port,
             data_dir: data_dir.to_owned(),
+            path,
             mounted: vec![],
             _own_data_dir: None,
         }
@@ -40,7 +58,7 @@ impl Daemon {
     /// the same data directory.
     pub fn restart(&mut self) {
         self.kill();
-        let (child, port) = spawn(&self.data_dir);
+        let (child, port) = spawn(&self.data_dir, self.path.as_deref());
         self.child = child;
         self.port = port;
     }
@@ -113,13 +131,16 @@ impl Daemon {
     }
 }
 
-fn spawn(data_dir: &Path) -> (Child, u16) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
+fn spawn(data_dir: &Path, path: Option<&OsStr>) -> (Child, u16) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"));
+    command
         .args(["--listen", "127.0.0.1:0", "--data-dir"])
         .arg(data_dir)
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stdout(Stdio::piped());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let mut child = command.spawn().unwrap();
     let mut line = String::new();
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut line)

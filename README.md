@@ -229,6 +229,12 @@ After an NFS client crossed into a bind mount, `nfsd` holds it, and a plain `umo
 A client that still has its submount sees the old entry or "Stale file handle" until it mounts
 `src` again.
 
+Each host directory binds the same store entries, so `nfsd` gives their bind mounts one file
+handle. Its export cache keeps that handle on the first bind mount that a client crossed into.
+After the daemon removes bind mounts, it runs `exportfs -f`, so clients of other host
+directories do not hang on a removed mount. When `exportfs` is missing or fails, the daemon
+prints the error and the call still succeeds.
+
 ## Changes made outside the view
 
 Changes in `src`, for example from NFS clients, show in `dst` within 1 second. The view sends

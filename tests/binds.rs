@@ -196,6 +196,45 @@ fn unbind_removes_the_bind_mounts() {
     assert!(!tree.path("h1/tools").exists());
 }
 
+fn bound_with_exportfs() -> (Tree, Daemon) {
+    let tree = Tree::new();
+    fs::create_dir(tree.path("bin")).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {}\n",
+        tree.path("exportfs.log").display()
+    );
+    fs::write(tree.path("bin/exportfs"), script).unwrap();
+    fs::set_permissions(tree.path("bin/exportfs"), fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = Daemon::start_with_bin(&tree.path("bin"));
+    daemon.bind_ok(tree.bind_params("h1"));
+    (tree, daemon)
+}
+
+fn exportfs_calls(tree: &Tree) -> String {
+    fs::read_to_string(tree.path("exportfs.log")).unwrap_or_default()
+}
+
+#[test]
+fn bind_keeps_the_nfs_export_cache() {
+    let (tree, _daemon) = bound_with_exportfs();
+    assert_eq!(exportfs_calls(&tree), "");
+}
+
+#[test]
+fn unbind_flushes_the_nfs_export_cache() {
+    let (tree, daemon) = bound_with_exportfs();
+    unbind(&daemon, &tree);
+    assert_eq!(exportfs_calls(&tree), "-f\n");
+}
+
+#[test]
+fn removed_store_entry_flushes_the_nfs_export_cache() {
+    let (tree, daemon) = bound_with_exportfs();
+    fs::remove_file(tree.path("shared/notes.md")).unwrap();
+    daemon.bind_ok(tree.bind_params("h1"));
+    assert_eq!(exportfs_calls(&tree), "-f\n");
+}
+
 #[test]
 fn entry_with_content_stays() {
     let tree = Tree::new();
