@@ -42,6 +42,7 @@ curl -s http://127.0.0.1:8742/api -d '{
     "type": "cattle",
     "src": "/home/user/Dev/.vm-herd/truenas/workdir/192.168.2.130",
     "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+    "fallback": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/fallback"},
     "dst": "/home/user/Dev/truenas",
     "squash": {"uid": 1000, "gid": 1000}
   }
@@ -52,17 +53,25 @@ On success, the result is `null`.
 
 | Param | Meaning |
 |---|---|
-| `type` | `cattle` or `pet`. A cattle view is described below. A pet view shows `src` at `dst` with `squash` and nothing else: `overlay` must be absent or `null`. A pet comes back after a daemon start, and `umount` refuses it. |
+| `type` | `cattle` or `pet`. A cattle view is described below. A pet view shows `src` at `dst` with `squash` and nothing else: `overlay` and `fallback` must be absent or `null`. A pet comes back after a daemon start, and `umount` refuses it. |
 | `src` | The host directory. `dst` is a passthrough of it. Each directory in it is a project. |
 | `overlay` | `null`, or the store for IDE directories: `{"src", "directories"}`. Absent means `null`. |
 | `overlay.src` | Holds `<project>/<name>` for each project. Each directory in it is a project too. A project that `src` does not have shows as a read-only directory. |
 | `overlay.directories` | Names such as `.idea`. `dst/<project>/<name>` shows `overlay.src/<project>/<name>` when it exists. A create of `dst/<project>/<name>` creates it there. The same names in `src` stay hidden and untouched. |
+| `fallback` | `null`, or the store for entries that a project lacks: `{"src"}`. Absent means `null`. Cattle only. |
+| `fallback.src` | Holds entries such as `.git`. Each entry shows in each project, as described below. |
 | `dst` | The mount point. When it does not exist, the daemon creates it with mode `0755`. With `squash`, the new directory gets owner `squash.uid:squash.gid`. An existing `dst` stays as it is. |
 | `squash` | `null`, or `{"uid", "gid"}`. With `squash`, every file shows as `uid:gid`, new files get owner 0:0 on disk, and chown changes nothing on disk. Without it, files show their real owners and new files belong to the caller. |
 
-All paths must be absolute. `src` and `overlay.src` must be existing directories. `dst` may be
-missing when its parent exists. `dst` must not overlap `src`, `overlay.src`, or another served
-`dst`.
+Each entry `<e>` of `fallback.src` shows as `dst/<project>/<e>` when `src/<project>/<e>` does not
+exist and `<e>` is not in `overlay.directories`. With a `.git` in the store, IDEs keep the Git root
+of each project, also while the view has no `src`. The fallback entries are read-only: writes,
+creates, removes, renames, and metadata changes in them fail with `EROFS`. Each project shows its
+own inode numbers for them. A real entry in `src` always wins.
+
+All paths must be absolute. `src`, `overlay.src`, and `fallback.src` must be existing
+directories. `dst` may be missing when its parent exists. `dst` must not overlap `src`,
+`overlay.src`, `fallback.src`, or another served `dst`.
 
 A pet mount:
 
@@ -127,6 +136,7 @@ curl -s http://127.0.0.1:8742/api -d '{"jsonrpc": "2.0", "id": 3, "method": "mou
     "type": "cattle",
     "src": "/home/user/Dev/.vm-herd/truenas/workdir/192.168.2.130",
     "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+    "fallback": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/fallback"},
     "dst": "/home/user/Dev/truenas",
     "squash": {"uid": 1000, "gid": 1000}
   }
@@ -135,7 +145,7 @@ curl -s http://127.0.0.1:8742/api -d '{"jsonrpc": "2.0", "id": 3, "method": "mou
 
 Each item has the form of the `mount` params, with the config that the view shows now. `src`
 is `null` for a restored cattle view, after a daemon start or after `umount`. A pet item shows
-its `src` and `overlay` `null`. Bind mounts do not show. Params other than none, `null`, `{}`,
+its `src`, `overlay` `null`, and `fallback` `null`. Bind mounts do not show. Params other than none, `null`, `{}`,
 or `[]` fail with `-32602`.
 
 ### bind
@@ -254,6 +264,7 @@ After each successful `mount`, `bind`, and `unbind`, the daemon writes
       "type": "cattle",
       "dst": "/home/user/Dev/truenas",
       "overlay": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/overlay", "directories": [".idea"]},
+      "fallback": {"src": "/home/user/Dev/.vm-herd/truenas/workdir/fallback"},
       "squash": {"uid": 1000, "gid": 1000}
     },
     {
@@ -273,8 +284,9 @@ After each successful `mount`, `bind`, and `unbind`, the daemon writes
 ```
 
 `mounts` holds each cattle `dst` whose last `mount` had an `overlay`, and each pet `dst`. A
-cattle `mount` without `overlay` removes the `dst` from the file. `binds` holds each `dst`
-whose last call was a successful `bind`.
+cattle `mount` without `overlay` removes the `dst` from the file. A cattle item holds the
+`fallback` of its last `mount`, or `null`. A cattle item without `fallback` loads as `null`.
+`binds` holds each `dst` whose last call was a successful `bind`.
 
 A `state.json` from a version before `bind`, or with `binds` items that hold `shared`, has
 another shape, and the daemon does not start with it. Remove the file once before you start
@@ -285,12 +297,13 @@ connected"), and the bind mounts stay and keep working. At the next start, the d
 binds each stored `binds` item again. A bind mount that is still there stays, and the daemon
 never adds a second one. Then the daemon detaches its earlier mount at each stored `dst` and
 mounts a view without `src`: every project of `overlay.src` shows with only its overlay
-directories, and the root is read-only. For a pet item, it mounts the stored `src` at `dst`
+directories and the fallback entries, and the root is read-only. For a pet item, it mounts the stored `src` at `dst`
 again. The next `mount` call for that `dst` replaces the view in place. Only one daemon can run
 on a host.
 
 The daemon skips a stored `dst` that is missing or holds another mount, a pet whose `src` is
-missing, and a `binds` item that fails the checks of `bind`. It prints the reason and keeps
+missing, a cattle item whose `fallback.src` is missing, and a `binds` item that fails the checks
+of `bind`. It prints the reason and keeps
 the item in the file. It does not start when `state.json` has an unknown `version`.
 
 ## Checks

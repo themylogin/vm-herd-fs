@@ -35,6 +35,7 @@ pub struct Config {
     pub src: Option<Arc<OwnedFd>>,
     pub overlay: Option<Overlay>,
     pub squash: Option<Squash>,
+    pub fallback: Option<Arc<OwnedFd>>,
 }
 
 impl Config {
@@ -116,6 +117,29 @@ impl Config {
             Err(err) => return Err(sys(err)),
         };
         match open_path(&project_fd, name) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(err) => Err(sys(err)),
+        }
+    }
+
+    /// The store entry that `dst/<project>/<name>` shows, when `name` is not an overlay name
+    /// and the project's src has no `name`.
+    fn fallback_entry(&self, project: &OsStr, name: &OsStr) -> Res<Option<OwnedFd>> {
+        let Some(store) = &self.fallback else {
+            return Ok(None);
+        };
+        if self.is_overlay_name(name) {
+            return Ok(None);
+        }
+        if let Some(backing) = self.project_backing(project) {
+            match rustix::fs::statat(&backing, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => return Ok(None),
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(err) => return Err(sys(err)),
+            }
+        }
+        match open_path(&**store, name) {
             Ok(fd) => Ok(Some(fd)),
             Err(rustix::io::Errno::NOENT) => Ok(None),
             Err(err) => Err(sys(err)),
@@ -207,7 +231,7 @@ impl View {
     }
 
     fn record(&self, parent: u64, parent_node: &Node, name: &OsStr) {
-        if !matches!(parent_node, Node::Real(_)) {
+        if !matches!(parent_node, Node::Real(..)) {
             lock(&self.cached_names).insert((parent, name.to_owned()));
         }
     }
@@ -218,15 +242,21 @@ impl View {
         Ok(attr(id, &st, config.squash))
     }
 
-    fn remember(&self, config: &Config, fd: OwnedFd) -> Res<FileAttr> {
+    fn remember(&self, config: &Config, realm: u64, fd: OwnedFd) -> Res<FileAttr> {
         let st = rustix::fs::fstat(&fd).map_err(sys)?;
-        let id = lock(&self.nodes).remember(key(&st), fd);
+        let id = lock(&self.nodes).remember(key(realm, &st), fd);
         Ok(attr(id, &st, config.squash))
     }
 
-    fn real_entry(&self, config: &Config, dir: impl AsFd, name: &OsStr) -> Res<FileAttr> {
+    fn real_entry(
+        &self,
+        config: &Config,
+        dir: impl AsFd,
+        realm: u64,
+        name: &OsStr,
+    ) -> Res<FileAttr> {
         let fd = open_path(dir, name).map_err(sys)?;
-        self.remember(config, fd)
+        self.remember(config, realm, fd)
     }
 
     fn lookup(&self, parent: u64, name: &OsStr) -> Res<FileAttr> {
@@ -238,19 +268,21 @@ impl View {
                     self.project_attr(&config, name)?
                 } else {
                     let src = config.src.as_ref().ok_or(Errno::ENOENT)?;
-                    self.real_entry(&config, &**src, name)?
+                    self.real_entry(&config, &**src, 0, name)?
                 }
             }
             Node::Project(project) => {
                 if config.is_overlay_name(name) {
                     let fd = config.overlay_entry(project, name)?.ok_or(Errno::ENOENT)?;
-                    self.remember(&config, fd)?
+                    self.remember(&config, 0, fd)?
+                } else if let Some(fd) = config.fallback_entry(project, name)? {
+                    self.remember(&config, parent, fd)?
                 } else {
                     let backing = config.project_backing(project).ok_or(Errno::ENOENT)?;
-                    self.real_entry(&config, &backing, name)?
+                    self.real_entry(&config, &backing, 0, name)?
                 }
             }
-            Node::Real(fd) => self.real_entry(&config, &**fd, name)?,
+            Node::Real(fd, realm) => self.real_entry(&config, &**fd, *realm, name)?,
         };
         self.record(parent, &parent_node, name);
         Ok(attr)
@@ -261,7 +293,7 @@ impl View {
         match self.node(id)? {
             Node::Root => Ok(attr(ROOT_ID, &config.root_stat()?, config.squash)),
             Node::Project(name) => self.project_attr(&config, &name),
-            Node::Real(fd) => {
+            Node::Real(fd, _) => {
                 let st = rustix::fs::fstat(&*fd).map_err(sys)?;
                 Ok(attr(id, &st, config.squash))
             }
@@ -276,7 +308,7 @@ impl View {
                 .project_backing(&name)
                 .map(Arc::new)
                 .ok_or(Errno::EROFS),
-            Node::Real(fd) => Ok(fd),
+            Node::Real(fd, _) => Ok(fd),
         }
     }
 
@@ -287,7 +319,7 @@ impl View {
                 .project_backing(name)
                 .map(Arc::new)
                 .ok_or(Errno::ENOENT),
-            Node::Real(fd) => Ok(fd.clone()),
+            Node::Real(fd, _) => Ok(fd.clone()),
         }
     }
 
@@ -309,9 +341,19 @@ impl View {
         let fixed = match parent {
             Node::Project(_) => config.is_overlay_name(name),
             Node::Root => config.is_overlay_only_project(name),
-            Node::Real(_) => false,
+            Node::Real(..) => false,
         };
         if fixed { Err(Errno::EPERM) } else { Ok(()) }
+    }
+
+    fn check_removable(config: &Config, parent: &Node, name: &OsStr) -> Res<()> {
+        check_writable(parent)?;
+        match parent {
+            Node::Project(project) if config.fallback_entry(project, name)?.is_some() => {
+                Err(Errno::EROFS)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn give_to_caller(config: &Config, dir: &OwnedFd, name: &OsStr, owner: Owner) -> Res<()> {
@@ -339,10 +381,14 @@ impl View {
         dir: &OwnedFd,
         name: &OsStr,
     ) -> Res<FileAttr> {
+        let realm = match parent_node {
+            Node::Real(_, realm) => *realm,
+            _ => 0,
+        };
         let attr = if matches!(parent_node, Node::Root) && config.is_project(name)? {
             self.project_attr(config, name)?
         } else {
-            self.real_entry(config, dir, name)?
+            self.real_entry(config, dir, realm, name)?
         };
         self.record(parent, parent_node, name);
         Ok(attr)
@@ -357,6 +403,7 @@ impl View {
     ) -> Res<FileAttr> {
         let config = self.config();
         let parent_node = self.node(parent)?;
+        check_writable(&parent_node)?;
         let dir = self.creatable_dir(&config, &parent_node, name)?;
         create(&dir).map_err(sys)?;
         Self::give_to_caller(&config, &dir, name, owner)?;
@@ -374,6 +421,7 @@ impl View {
     ) -> Res<(FileAttr, u64)> {
         let config = self.config();
         let parent_node = self.node(parent)?;
+        check_writable(&parent_node)?;
         let dir = self.creatable_dir(&config, &parent_node, name)?;
         let oflags = open_flags(flags) | OFlags::CREATE;
         let fd = rustix::fs::openat(
@@ -391,10 +439,13 @@ impl View {
 
     fn link(&self, id: u64, new_parent: u64, new_name: &OsStr) -> Res<FileAttr> {
         let config = self.config();
-        let Node::Real(source) = self.node(id)? else {
+        let source_node = self.node(id)?;
+        check_writable(&source_node)?;
+        let Node::Real(source, _) = source_node else {
             return Err(Errno::EPERM);
         };
         let parent_node = self.node(new_parent)?;
+        check_writable(&parent_node)?;
         let dir = self.creatable_dir(&config, &parent_node, new_name)?;
         rustix::fs::linkat(&*source, "", &*dir, new_name, AtFlags::EMPTY_PATH).map_err(sys)?;
         self.created_entry(&config, new_parent, &parent_node, &dir, new_name)
@@ -404,6 +455,7 @@ impl View {
         let config = self.config();
         let parent_node = self.node(parent)?;
         Self::check_fixed(&config, &parent_node, name)?;
+        Self::check_removable(&config, &parent_node, name)?;
         let dir = self.existing_dir(&config, &parent_node)?;
         rustix::fs::unlinkat(&*dir, name, flags).map_err(sys)
     }
@@ -421,6 +473,8 @@ impl View {
         let new_parent_node = self.node(new_parent)?;
         Self::check_fixed(&config, &parent_node, name)?;
         Self::check_fixed(&config, &new_parent_node, new_name)?;
+        Self::check_removable(&config, &parent_node, name)?;
+        check_writable(&new_parent_node)?;
         let dir = self.existing_dir(&config, &parent_node)?;
         let new_dir = self.creatable_dir(&config, &new_parent_node, new_name)?;
         let flags = rustix::fs::RenameFlags::from_bits_retain(flags.bits());
@@ -440,6 +494,7 @@ impl View {
         fh: Option<FileHandle>,
     ) -> Res<FileAttr> {
         let config = self.config();
+        check_writable(&self.node(id)?)?;
         let fd = self.backing(&config, id)?;
         if let Some(mode) = mode {
             rustix::fs::chmod(proc_path(&fd).as_str(), Mode::from_raw_mode(mode & 0o7777))
@@ -479,7 +534,7 @@ impl View {
     }
 
     fn readlink(&self, id: u64) -> Res<Vec<u8>> {
-        let Node::Real(fd) = self.node(id)? else {
+        let Node::Real(fd, _) = self.node(id)? else {
             return Err(Errno::EINVAL);
         };
         let target = rustix::fs::readlinkat(&*fd, "", Vec::new()).map_err(sys)?;
@@ -487,7 +542,11 @@ impl View {
     }
 
     fn open(&self, id: u64, flags: i32) -> Res<u64> {
-        let Node::Real(fd) = self.node(id)? else {
+        let node = self.node(id)?;
+        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0 {
+            check_writable(&node)?;
+        }
+        let Node::Real(fd, _) = node else {
             return Err(Errno::EISDIR);
         };
         let file = rustix::fs::open(proc_path(&fd).as_str(), open_flags(flags), Mode::empty())
@@ -514,9 +573,9 @@ impl View {
         let entries = match self.node(id)? {
             Node::Root => self.root_entries(&config)?,
             Node::Project(name) => self.project_entries(&config, id, &name)?,
-            Node::Real(fd) => {
+            Node::Real(fd, realm) => {
                 let mut entries = vec![dot(".", id), dot("..", id)];
-                entries.extend(self.dir_entries(&fd, |_| false)?);
+                entries.extend(self.dir_entries(&fd, realm, |_| false)?);
                 entries
             }
         };
@@ -535,7 +594,7 @@ impl View {
                 }
                 let id = match entry.kind {
                     FileType::Directory => nodes.project_id(&entry.name),
-                    _ => nodes.id_for_key((dev, entry.id)),
+                    _ => nodes.id_for_key((0, dev, entry.id)),
                 };
                 entries.push(DirEntry { id, ..entry });
             }
@@ -554,30 +613,41 @@ impl View {
     fn project_entries(&self, config: &Config, id: u64, project: &OsStr) -> Res<Vec<DirEntry>> {
         let mut entries = vec![dot(".", id), dot("..", ROOT_ID)];
         if let Some(backing) = config.project_backing(project) {
-            entries.extend(self.dir_entries(&backing, |name| config.is_overlay_name(name))?);
+            entries.extend(self.dir_entries(&backing, 0, |name| config.is_overlay_name(name))?);
         }
         if let Some(overlay) = &config.overlay {
             for name in &overlay.directories {
                 if let Some(fd) = config.overlay_entry(project, name)? {
                     let st = rustix::fs::fstat(&fd).map_err(sys)?;
                     entries.push(DirEntry {
-                        id: lock(&self.nodes).id_for_key(key(&st)),
+                        id: lock(&self.nodes).id_for_key(key(0, &st)),
                         kind: kind(st.st_mode),
                         name: name.clone(),
                     });
                 }
             }
         }
+        if let Some(store) = &config.fallback {
+            let shown: HashSet<OsString> = entries.iter().map(|entry| entry.name.clone()).collect();
+            entries.extend(self.dir_entries(store, id, |name| {
+                config.is_overlay_name(name) || shown.contains(name)
+            })?);
+        }
         Ok(entries)
     }
 
-    fn dir_entries(&self, fd: &OwnedFd, hidden: impl Fn(&OsStr) -> bool) -> Res<Vec<DirEntry>> {
+    fn dir_entries(
+        &self,
+        fd: &OwnedFd,
+        realm: u64,
+        hidden: impl Fn(&OsStr) -> bool,
+    ) -> Res<Vec<DirEntry>> {
         let dev = device(fd)?;
         let mut entries = list(fd)?;
         entries.retain(|entry| !hidden(&entry.name));
         let mut nodes = lock(&self.nodes);
         for entry in &mut entries {
-            entry.id = nodes.id_for_key((dev, entry.id));
+            entry.id = nodes.id_for_key((realm, dev, entry.id));
         }
         Ok(entries)
     }
@@ -593,6 +663,11 @@ impl View {
 
     fn xattr_target(&self, id: u64) -> Res<Arc<OwnedFd>> {
         self.backing(&self.config(), id)
+    }
+
+    fn writable_xattr_target(&self, id: u64) -> Res<Arc<OwnedFd>> {
+        check_writable(&self.node(id)?)?;
+        self.xattr_target(id)
     }
 
     fn add_handle(&self, handle: Handle) -> u64 {
@@ -661,6 +736,14 @@ fn dot(name: &str, id: u64) -> DirEntry {
         id,
         kind: FileType::Directory,
         name: name.into(),
+    }
+}
+
+/// Fallback entries and every path inside them are read-only.
+fn check_writable(node: &Node) -> Res<()> {
+    match node {
+        Node::Real(_, realm) if *realm != 0 => Err(Errno::EROFS),
+        _ => Ok(()),
     }
 }
 
@@ -733,12 +816,12 @@ fn is_dir(st: &Stat) -> bool {
 
 // Stat field types differ between architectures, so some casts are no-ops on x86_64.
 #[allow(clippy::unnecessary_cast)]
-fn key(st: &Stat) -> Key {
-    (st.st_dev as u64, st.st_ino as u64)
+fn key(realm: u64, st: &Stat) -> Key {
+    (realm, st.st_dev as u64, st.st_ino as u64)
 }
 
 fn device(fd: &OwnedFd) -> Res<u64> {
-    Ok(key(&rustix::fs::fstat(fd).map_err(sys)?).0)
+    Ok(key(0, &rustix::fs::fstat(fd).map_err(sys)?).1)
 }
 
 fn kind(mode: u32) -> FileType {
@@ -1132,7 +1215,7 @@ impl Filesystem for Fs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        let result = self.0.xattr_target(ino.0).and_then(|fd| {
+        let result = self.0.writable_xattr_target(ino.0).and_then(|fd| {
             let flags = rustix::fs::XattrFlags::from_bits_retain(flags as u32);
             rustix::fs::setxattr(proc_path(&fd).as_str(), name, value, flags).map_err(sys)
         });
@@ -1170,7 +1253,7 @@ impl Filesystem for Fs {
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let result = self
             .0
-            .xattr_target(ino.0)
+            .writable_xattr_target(ino.0)
             .and_then(|fd| rustix::fs::removexattr(proc_path(&fd).as_str(), name).map_err(sys));
         reply_empty(reply, result);
     }
@@ -1214,5 +1297,187 @@ impl Filesystem for Fs {
             rustix::fs::fallocate(&*file, flags, offset, length).map_err(sys)
         });
         reply_empty(reply, result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    struct Tree {
+        dir: TempDir,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            let tree = Self {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            fs::create_dir_all(tree.path("src/proj1")).unwrap();
+            fs::create_dir_all(tree.path("src/proj2")).unwrap();
+            fs::create_dir_all(tree.path("overlay/proj1/.idea")).unwrap();
+            fs::create_dir_all(tree.path("fallback/.git/refs")).unwrap();
+            fs::write(tree.path("fallback/.git/HEAD"), "substitute").unwrap();
+            tree
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.dir.path().join(relative)
+        }
+
+        fn dir(&self, relative: &str) -> Arc<OwnedFd> {
+            Arc::new(open_dir_path(rustix::fs::CWD, self.path(relative).as_os_str()).unwrap())
+        }
+
+        fn view(&self, src: bool, fallback: bool) -> View {
+            View::new(Config {
+                src: src.then(|| self.dir("src")),
+                overlay: Some(Overlay {
+                    src: self.dir("overlay"),
+                    directories: vec![".idea".into()],
+                }),
+                squash: None,
+                fallback: fallback.then(|| self.dir("fallback")),
+            })
+        }
+    }
+
+    fn walk(view: &View, path: &str) -> Res<u64> {
+        let mut id = ROOT_ID;
+        for name in path.split('/') {
+            id = view.lookup(id, OsStr::new(name))?.ino.0;
+        }
+        Ok(id)
+    }
+
+    fn names(view: &View, path: &str) -> Vec<OsString> {
+        let fh = view.opendir(walk(view, path).unwrap()).unwrap();
+        let mut names: Vec<OsString> = view
+            .dir(fh)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .filter(|name| name != "." && name != "..")
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn content(view: &View, path: &str) -> String {
+        let fh = view
+            .open(walk(view, path).unwrap(), libc::O_RDONLY)
+            .unwrap();
+        String::from_utf8(view.read(fh, 0, 100).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn project_without_git_shows_the_substitute() {
+        let tree = Tree::new();
+        let view = tree.view(true, true);
+        assert_eq!(names(&view, "proj2"), [".git"]);
+        assert_eq!(names(&view, "proj2/.git"), ["HEAD", "refs"]);
+        assert_eq!(content(&view, "proj2/.git/HEAD"), "substitute");
+    }
+
+    #[test]
+    fn git_of_src_hides_the_substitute() {
+        let tree = Tree::new();
+        fs::create_dir(tree.path("src/proj1/.git")).unwrap();
+        fs::write(tree.path("src/proj1/.git/HEAD"), "real").unwrap();
+        let view = tree.view(true, true);
+        assert_eq!(names(&view, "proj1"), [".git", ".idea"]);
+        assert_eq!(content(&view, "proj1/.git/HEAD"), "real");
+    }
+
+    #[test]
+    fn restored_view_shows_the_substitute() {
+        let tree = Tree::new();
+        let view = tree.view(false, true);
+        assert_eq!(names(&view, "proj1"), [".git", ".idea"]);
+        assert_eq!(content(&view, "proj1/.git/HEAD"), "substitute");
+    }
+
+    #[test]
+    fn view_without_fallback() {
+        let tree = Tree::new();
+        let view = tree.view(true, false);
+        assert!(names(&view, "proj2").is_empty());
+        assert_eq!(walk(&view, "proj2/.git"), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn any_store_entry() {
+        let tree = Tree::new();
+        fs::write(tree.path("fallback/.envrc"), "layout python").unwrap();
+        let view = tree.view(true, true);
+        assert_eq!(names(&view, "proj2"), [".envrc", ".git"]);
+        assert_eq!(content(&view, "proj2/.envrc"), "layout python");
+    }
+
+    #[test]
+    fn empty_store() {
+        let tree = Tree::new();
+        fs::remove_dir_all(tree.path("fallback/.git")).unwrap();
+        let view = tree.view(true, true);
+        assert!(names(&view, "proj2").is_empty());
+        assert_eq!(walk(&view, "proj2/.git"), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn write_to_a_substitute_file() {
+        let tree = Tree::new();
+        let view = tree.view(true, true);
+        let head = walk(&view, "proj2/.git/HEAD").unwrap();
+        assert_eq!(view.open(head, libc::O_WRONLY).err(), Some(Errno::EROFS));
+        assert_eq!(
+            view.open(head, libc::O_RDONLY | libc::O_TRUNC).err(),
+            Some(Errno::EROFS)
+        );
+        let mode = Some(0o600);
+        let reply = view.setattr(head, mode, None, None, None, None, None, None);
+        assert_eq!(reply.err(), Some(Errno::EROFS));
+        assert_eq!(
+            fs::read_to_string(tree.path("fallback/.git/HEAD")).unwrap(),
+            "substitute"
+        );
+    }
+
+    #[test]
+    fn remove_a_substitute_entry() {
+        let tree = Tree::new();
+        let view = tree.view(true, true);
+        let git = walk(&view, "proj2/.git").unwrap();
+        let proj2 = walk(&view, "proj2").unwrap();
+        let removed = view.remove(git, OsStr::new("HEAD"), AtFlags::empty());
+        assert_eq!(removed, Err(Errno::EROFS));
+        let removed = view.remove(proj2, OsStr::new(".git"), AtFlags::REMOVEDIR);
+        assert_eq!(removed, Err(Errno::EROFS));
+        let renamed = view.rename(
+            proj2,
+            OsStr::new(".git"),
+            proj2,
+            OsStr::new("git"),
+            RenameFlags::empty(),
+        );
+        assert_eq!(renamed, Err(Errno::EROFS));
+        assert!(tree.path("fallback/.git/HEAD").exists());
+    }
+
+    #[test]
+    fn each_project_gets_its_own_substitute_inodes() {
+        let tree = Tree::new();
+        let view = tree.view(true, true);
+        assert_ne!(walk(&view, "proj1/.git"), walk(&view, "proj2/.git"));
+        assert_ne!(
+            walk(&view, "proj1/.git/refs"),
+            walk(&view, "proj2/.git/refs")
+        );
+        let fh = view.opendir(walk(&view, "proj1").unwrap()).unwrap();
+        let listed = view.dir(fh).unwrap();
+        let git = listed.iter().find(|entry| entry.name == ".git").unwrap();
+        assert_eq!(Ok(git.id), walk(&view, "proj1/.git"));
     }
 }

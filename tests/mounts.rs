@@ -39,6 +39,25 @@ fn mounted_host() {
             "type": "cattle",
             "src": tree.path("h1"),
             "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "fallback": null,
+            "dst": tree.path("d"),
+            "squash": {"uid": 1000, "gid": 1000},
+        }])
+    );
+}
+
+#[test]
+fn mounted_host_with_a_fallback() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.fallback_params("h1", "d"));
+    assert_eq!(
+        mounts(&daemon),
+        json!([{
+            "type": "cattle",
+            "src": tree.path("h1"),
+            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "fallback": {"src": tree.path("fallback")},
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -72,7 +91,7 @@ fn two_views() {
 fn restored_view_after_a_restart() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
-    daemon.mount_ok(tree.params("h1", "d"));
+    daemon.mount_ok(tree.fallback_params("h1", "d"));
     daemon.restart();
     assert_eq!(
         mounts(&daemon),
@@ -80,6 +99,7 @@ fn restored_view_after_a_restart() {
             "type": "cattle",
             "src": null,
             "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "fallback": {"src": tree.path("fallback")},
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -98,6 +118,7 @@ fn pet_after_a_restart() {
             "type": "pet",
             "src": tree.path("h1"),
             "overlay": null,
+            "fallback": null,
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -117,6 +138,7 @@ fn shared_pet_after_a_restart() {
             "type": "pet",
             "src": tree.path("h1"),
             "overlay": null,
+            "fallback": null,
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])

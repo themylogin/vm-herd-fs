@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::OverlayParams;
+use crate::api::{FallbackParams, OverlayParams};
 use crate::view::Squash;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -13,6 +13,7 @@ pub enum StoredMount {
     Cattle {
         dst: PathBuf,
         overlay: OverlayParams,
+        fallback: Option<FallbackParams>,
         squash: Option<Squash>,
     },
     Pet {
@@ -112,11 +113,15 @@ mod tests {
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].dst(), Path::new("/d"));
         let StoredMount::Cattle {
-            overlay, squash, ..
+            overlay,
+            fallback,
+            squash,
+            ..
         } = &mounts[0]
         else {
             panic!("not a cattle item");
         };
+        assert!(fallback.is_none());
         assert_eq!(overlay.src, Path::new("/w/overlay"));
         assert_eq!(overlay.directories, [".idea"]);
         assert_eq!(
@@ -220,6 +225,9 @@ mod tests {
                 src: "/w/overlay".into(),
                 directories: vec![".idea".into()],
             },
+            fallback: Some(FallbackParams {
+                src: "/w/fallback".into(),
+            }),
             squash: None,
         };
         let pet = StoredMount::Pet {
@@ -241,6 +249,10 @@ mod tests {
         assert!(text.contains(r#""type": "pet""#), "{text}");
         let (mounts, binds) = load(dir.path()).unwrap();
         assert_eq!(mounts[0].dst(), Path::new("/d"));
+        assert!(matches!(
+            &mounts[0],
+            StoredMount::Cattle { fallback: Some(fallback), .. } if fallback.src == Path::new("/w/fallback")
+        ));
         assert!(matches!(&mounts[1], StoredMount::Pet { src, .. } if src == Path::new("/w/h1")));
         assert_eq!(binds[0].src, Path::new("/w/shared"));
         assert_eq!(binds[0].dst, Path::new("/w/h1"));

@@ -233,6 +233,8 @@ impl Tree {
         fs::create_dir_all(tree.path("shared/tools")).unwrap();
         fs::write(tree.path("shared/notes.md"), "shared notes\n").unwrap();
         fs::write(tree.path("shared/tools/run.sh"), "#!/bin/sh\n").unwrap();
+        fs::create_dir_all(tree.path("fallback/.git")).unwrap();
+        fs::write(tree.path("fallback/.git/HEAD"), "ref: refs/heads/main").unwrap();
         fs::create_dir_all(tree.path("d")).unwrap();
         fs::create_dir_all(tree.path("d2")).unwrap();
         tree
@@ -240,6 +242,12 @@ impl Tree {
 
     pub fn path(&self, relative: &str) -> PathBuf {
         self.dir.path().join(relative)
+    }
+
+    pub fn fallback_params(&self, host: &str, dst: &str) -> Value {
+        let mut params = self.params(host, dst);
+        params["fallback"] = json!({"src": self.path("fallback")});
+        params
     }
 
     pub fn params(&self, host: &str, dst: &str) -> Value {

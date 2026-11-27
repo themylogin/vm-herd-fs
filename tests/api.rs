@@ -164,6 +164,39 @@ fn name_with_a_slash() {
 }
 
 #[test]
+fn missing_fallback_src() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.params("h1", "d");
+    params["fallback"] = json!({"src": tree.path("gone")});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("fallback.src"), "{message}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn fallback_with_an_unknown_member() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.fallback_params("h1", "d");
+    params["fallback"]["directories"] = json!([".git"]);
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn dst_inside_the_fallback_store() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let reply = daemon.mount(tree.fallback_params("h1", "fallback/d"));
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    assert!(!tree.path("fallback/d").exists());
+}
+
+#[test]
 fn overlay_without_members() {
     let tree = Tree::new();
     let mut daemon = Daemon::start();
@@ -220,6 +253,19 @@ fn pet_with_an_overlay() {
     assert_eq!(reply["error"]["code"], -32602, "{reply}");
     let message = reply["error"]["message"].as_str().unwrap();
     assert!(message.contains("overlay"), "{message}");
+    assert!(!is_mount_point(&tree.path("d")));
+}
+
+#[test]
+fn pet_with_a_fallback() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    let mut params = tree.pet_params("h1", "d");
+    params["fallback"] = json!({"src": tree.path("fallback")});
+    let reply = daemon.mount(params);
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("fallback"), "{message}");
     assert!(!is_mount_point(&tree.path("d")));
 }
 

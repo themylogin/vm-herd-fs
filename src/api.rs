@@ -21,6 +21,7 @@ pub struct MountParams {
     pub type_: MountType,
     pub src: PathBuf,
     pub overlay: Option<OverlayParams>,
+    pub fallback: Option<FallbackParams>,
     pub dst: PathBuf,
     pub squash: Option<Squash>,
 }
@@ -31,6 +32,7 @@ pub struct MountsItem {
     pub type_: MountType,
     pub src: Option<PathBuf>,
     pub overlay: Option<OverlayParams>,
+    pub fallback: Option<FallbackParams>,
     pub dst: PathBuf,
     pub squash: Option<Squash>,
 }
@@ -59,6 +61,12 @@ struct UnbindParams {
 pub struct OverlayParams {
     pub src: PathBuf,
     pub directories: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackParams {
+    pub src: PathBuf,
 }
 
 struct RpcError {

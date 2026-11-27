@@ -5,16 +5,19 @@ use std::sync::Arc;
 
 pub const ROOT_ID: u64 = 1;
 
-pub type Key = (u64, u64);
+/// `(realm, dev, ino)`. The realm is 0, or the project id for the entries of a substitute
+/// `.git`, so that each project gets its own inodes for them.
+pub type Key = (u64, u64, u64);
 
 pub enum Node {
     Root,
     Project(OsString),
-    Real(Arc<OwnedFd>),
+    Real(Arc<OwnedFd>, u64),
 }
 
 struct Real {
     fd: Arc<OwnedFd>,
+    realm: u64,
     lookups: u64,
 }
 
@@ -46,7 +49,9 @@ impl Nodes {
         if let Some(name) = self.project_names.get(&id) {
             return Some(Node::Project(name.clone()));
         }
-        self.real.get(&id).map(|real| Node::Real(real.fd.clone()))
+        self.real
+            .get(&id)
+            .map(|real| Node::Real(real.fd.clone(), real.realm))
     }
 
     pub fn id_for_key(&mut self, key: Key) -> u64 {
@@ -85,6 +90,7 @@ impl Nodes {
             .and_modify(|real| real.lookups += 1)
             .or_insert_with(|| Real {
                 fd: Arc::new(fd),
+                realm: key.0,
                 lookups: 1,
             });
         id
@@ -118,27 +124,27 @@ mod tests {
     #[test]
     fn same_key_gives_same_id() {
         let mut nodes = Nodes::default();
-        let first = nodes.remember((1, 10), fd());
-        let second = nodes.remember((1, 10), fd());
+        let first = nodes.remember((0, 1, 10), fd());
+        let second = nodes.remember((0, 1, 10), fd());
         assert_eq!(first, second);
-        assert_ne!(first, nodes.remember((1, 11), fd()));
+        assert_ne!(first, nodes.remember((0, 1, 11), fd()));
     }
 
     #[test]
     fn id_survives_forget() {
         let mut nodes = Nodes::default();
-        let id = nodes.remember((1, 10), fd());
+        let id = nodes.remember((0, 1, 10), fd());
         nodes.forget(id, 1);
         assert!(nodes.get(id).is_none());
-        assert_eq!(nodes.remember((1, 10), fd()), id);
+        assert_eq!(nodes.remember((0, 1, 10), fd()), id);
         assert!(nodes.get(id).is_some());
     }
 
     #[test]
     fn descriptor_stays_until_every_lookup_is_forgotten() {
         let mut nodes = Nodes::default();
-        let id = nodes.remember((1, 10), fd());
-        nodes.remember((1, 10), fd());
+        let id = nodes.remember((0, 1, 10), fd());
+        nodes.remember((0, 1, 10), fd());
         nodes.forget(id, 1);
         assert!(nodes.get(id).is_some());
         nodes.forget(id, 1);

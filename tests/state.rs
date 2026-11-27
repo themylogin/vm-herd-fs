@@ -72,9 +72,45 @@ fn mount_with_overlay() {
             "type": "cattle",
             "dst": tree.path("d"),
             "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "fallback": null,
             "squash": {"uid": 1000, "gid": 1000},
         }], "binds": []})
     );
+}
+
+#[test]
+fn mount_with_a_fallback() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.fallback_params("h1", "d"));
+    assert_eq!(
+        state(&daemon),
+        json!({"version": 1, "mounts": [{
+            "type": "cattle",
+            "dst": tree.path("d"),
+            "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+            "fallback": {"src": tree.path("fallback")},
+            "squash": {"uid": 1000, "gid": 1000},
+        }], "binds": []})
+    );
+}
+
+#[test]
+fn cattle_item_without_fallback_key() {
+    let tree = Tree::new();
+    let data_dir = tree.path("data");
+    fs::create_dir(&data_dir).unwrap();
+    let stored = json!({"version": 1, "mounts": [{
+        "type": "cattle",
+        "dst": tree.path("d"),
+        "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+        "squash": null,
+    }], "binds": []});
+    fs::write(data_dir.join("state.json"), stored.to_string()).unwrap();
+    let mut daemon = Daemon::start_in(&data_dir);
+    daemon.track(&tree.path("d"));
+    assert_eq!(names(&tree.path("d")), ["proj1", "proj2", "proj3"]);
+    assert_eq!(names(&tree.path("d/proj1")), [".idea"]);
 }
 
 #[test]
@@ -156,6 +192,7 @@ fn restart_with_a_pet() {
             "type": "pet",
             "src": tree.path("h1"),
             "overlay": null,
+            "fallback": null,
             "dst": tree.path("d"),
             "squash": {"uid": 1000, "gid": 1000},
         }])
@@ -197,9 +234,29 @@ fn pet_src_missing_at_start() {
         "squash": null,
     }], "binds": []});
     fs::write(data_dir.join("state.json"), stored.to_string()).unwrap();
+    assert_item_with_gone_is_skipped(&tree, &data_dir, &stored);
+}
+
+#[test]
+fn fallback_src_missing_at_start() {
+    let tree = Tree::new();
+    let data_dir = tree.path("data");
+    fs::create_dir(&data_dir).unwrap();
+    let stored = json!({"version": 1, "mounts": [{
+        "type": "cattle",
+        "dst": tree.path("d"),
+        "overlay": {"src": tree.path("overlay"), "directories": [".idea"]},
+        "fallback": {"src": tree.path("gone")},
+        "squash": null,
+    }], "binds": []});
+    fs::write(data_dir.join("state.json"), stored.to_string()).unwrap();
+    assert_item_with_gone_is_skipped(&tree, &data_dir, &stored);
+}
+
+fn assert_item_with_gone_is_skipped(tree: &Tree, data_dir: &Path, stored: &Value) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_vm-herd-fs"))
         .args(["--listen", "127.0.0.1:0", "--data-dir"])
-        .arg(&data_dir)
+        .arg(data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -230,7 +287,7 @@ fn pet_src_missing_at_start() {
     );
     let after: Value =
         serde_json::from_str(&fs::read_to_string(data_dir.join("state.json")).unwrap()).unwrap();
-    assert_eq!(after, stored);
+    assert_eq!(&after, stored);
 }
 
 #[test]
@@ -313,6 +370,26 @@ fn restart_with_an_overlay() {
     assert_eq!(
         fs::metadata(tree.path("d/proj1/.idea")).unwrap().uid(),
         1000
+    );
+}
+
+#[test]
+fn restart_with_a_fallback() {
+    let tree = Tree::new();
+    let mut daemon = Daemon::start();
+    daemon.mount_ok(tree.fallback_params("h1", "d"));
+    daemon.kill();
+    let status = Command::new("umount")
+        .arg("-l")
+        .arg(tree.path("d"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    daemon.restart();
+    assert_eq!(names(&tree.path("d/proj1")), [".git", ".idea"]);
+    assert_eq!(
+        fs::read_to_string(tree.path("d/proj1/.git/HEAD")).unwrap(),
+        "ref: refs/heads/main"
     );
 }
 

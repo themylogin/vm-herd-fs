@@ -12,7 +12,7 @@ use fuser::{BackgroundSession, INodeNo, MountOption, Notifier, SessionACL};
 use rustix::fs::{CWD, Gid, Mode, OFlags, Uid};
 use rustix::mount::{MoveMountFlags, OpenTreeFlags, UnmountFlags};
 
-use crate::api::{BindParams, MountParams, MountType, MountsItem, OverlayParams};
+use crate::api::{BindParams, FallbackParams, MountParams, MountType, MountsItem, OverlayParams};
 use crate::state::{self, StoredBind, StoredMount};
 use crate::view::{Config, Fs, Invalidation, Overlay, Squash, View};
 
@@ -48,6 +48,7 @@ struct Shown {
     type_: MountType,
     src: Option<PathBuf>,
     overlay: Option<OverlayParams>,
+    fallback: Option<FallbackParams>,
     squash: Option<Squash>,
 }
 
@@ -123,6 +124,7 @@ impl Registry {
                 type_: mounted.shown.type_,
                 src: mounted.shown.src.clone(),
                 overlay: mounted.shown.overlay.clone(),
+                fallback: mounted.shown.fallback.clone(),
                 dst: dst.clone(),
                 squash: mounted.shown.squash,
             })
@@ -172,6 +174,11 @@ impl Registry {
                 "overlay is not allowed for type pet".into(),
             ));
         }
+        if params.type_ == MountType::Pet && params.fallback.is_some() {
+            return Err(MountError::InvalidParams(
+                "fallback is not allowed for type pet".into(),
+            ));
+        }
         let overlay = match &params.overlay {
             Some(overlay) => {
                 for name in &overlay.directories {
@@ -184,9 +191,16 @@ impl Registry {
             }
             None => None,
         };
+        let fallback_src = match &params.fallback {
+            Some(fallback) => Some(existing_dir("fallback.src", &fallback.src)?),
+            None => None,
+        };
         check_apart(&dst, "src", &src)?;
         if let Some((overlay_src, _)) = &overlay {
             check_apart(&dst, "overlay.src", overlay_src)?;
+        }
+        if let Some(fallback_src) = &fallback_src {
+            check_apart(&dst, "fallback.src", fallback_src)?;
         }
         for served in self.mounts.keys().filter(|served| **served != dst) {
             check_apart(&dst, "a served dst", served)?;
@@ -199,12 +213,17 @@ impl Registry {
                 None => None,
             },
             squash: params.squash,
+            fallback: match &fallback_src {
+                Some(fallback_src) => Some(open_dir(fallback_src)?),
+                None => None,
+            },
         };
 
         let shown = Shown {
             type_: params.type_,
             src: Some(params.src.clone()),
             overlay: params.overlay.clone(),
+            fallback: params.fallback.clone(),
             squash: params.squash,
         };
         if let Some(mounted) = self.mounts.get_mut(&dst) {
@@ -232,6 +251,7 @@ impl Registry {
             (MountType::Cattle, Some(overlay)) => Some(StoredMount::Cattle {
                 dst: dst.clone(),
                 overlay,
+                fallback: params.fallback,
                 squash: params.squash,
             }),
             (MountType::Cattle, None) => None,
@@ -358,9 +378,13 @@ fn restored_config(item: &StoredMount) -> Result<Config, MountError> {
             src: Some(open_dir(src)?),
             overlay: None,
             squash: *squash,
+            fallback: None,
         }),
         StoredMount::Cattle {
-            overlay, squash, ..
+            overlay,
+            fallback,
+            squash,
+            ..
         } => {
             for name in &overlay.directories {
                 check_name(name)?;
@@ -369,6 +393,10 @@ fn restored_config(item: &StoredMount) -> Result<Config, MountError> {
                 src: None,
                 overlay: Some(open_overlay(&overlay.src, &overlay.directories)?),
                 squash: *squash,
+                fallback: match fallback {
+                    Some(fallback) => Some(open_dir(&fallback.src)?),
+                    None => None,
+                },
             })
         }
     }
@@ -384,17 +412,22 @@ fn open_overlay(src: &Path, directories: &[String]) -> Result<Overlay, MountErro
 fn restored_shown(item: &StoredMount) -> Shown {
     match item {
         StoredMount::Cattle {
-            overlay, squash, ..
+            overlay,
+            fallback,
+            squash,
+            ..
         } => Shown {
             type_: MountType::Cattle,
             src: None,
             overlay: Some(overlay.clone()),
+            fallback: fallback.clone(),
             squash: *squash,
         },
         StoredMount::Pet { src, squash, .. } => Shown {
             type_: MountType::Pet,
             src: Some(src.clone()),
             overlay: None,
+            fallback: None,
             squash: *squash,
         },
     }
